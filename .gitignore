@@ -1,0 +1,5 @@
+src/__pycache__
+src/eval_csv
+src/eval_log
+data/
+adapter/
