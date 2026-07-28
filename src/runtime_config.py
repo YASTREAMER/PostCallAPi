@@ -4,17 +4,13 @@ import json
 import os
 from pathlib import Path
 
-FINE_TUNING_DIR = Path(
-    os.environ.get("POSTCALL_FINETUNING_DIR", "/dev/shm/PostCallFineTuning")
+# src/outputs/adapter; the adapter now lives directly at <API_DIR>/adapter.
+API_DIR = Path(
+    os.environ.get("POSTCALL_API_DIR", "PostCallAPi")
 ).resolve()
-
-CACHE_DIR = FINE_TUNING_DIR / "cache"
-HF_HOME = CACHE_DIR / "huggingface"
-HF_HUB_CACHE = HF_HOME / "hub"
-VLLM_CACHE_ROOT = CACHE_DIR / "vllm"
-
+ 
 MODEL_ID = "unsloth/Qwen3-14B-unsloth-bnb-4bit"
-ADAPTER_DIR = FINE_TUNING_DIR / "src" / "outputs" / "adapter"
+ADAPTER_DIR = API_DIR / "adapter"
 ADAPTER_NAME = "postcall-adapter"
 ADAPTER_ID = 1
 MAX_LORA_RANK = 16
@@ -37,20 +33,6 @@ if not 0 < GPU_MEMORY_UTILIZATION <= 1:
     )
 if not 1 <= API_PORT <= 65535:
     raise ValueError("POSTCALL_API_PORT must be between 1 and 65535")
-
-
-def configure_runtime_cache() -> None:
-    """Set cache variables before importing Hugging Face or vLLM."""
-    cache_locations = {
-        "HF_HOME": HF_HOME,
-        "HF_HUB_CACHE": HF_HUB_CACHE,
-        "HUGGINGFACE_HUB_CACHE": HF_HUB_CACHE,
-        "HF_XET_CACHE": HF_HOME / "xet",
-        "VLLM_CACHE_ROOT": VLLM_CACHE_ROOT,
-    }
-    for variable, path in cache_locations.items():
-        path.mkdir(parents=True, exist_ok=True)
-        os.environ[variable] = str(path)
 
 
 def validate_runtime_paths() -> None:

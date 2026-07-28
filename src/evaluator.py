@@ -196,11 +196,9 @@ def main():
     lora_request = LoRARequest(ADAPTER_NAME, ADAPTER_ID, str(ADAPTER_DIR))
     print(
         f"Loading vLLM engine for {MODEL_ID} with adapter {ADAPTER_DIR} "
-        f"(download_dir={HF_HUB_CACHE}) ..."
     )
     llm = LLM(
         model=MODEL_ID,
-        download_dir=str(HF_HUB_CACHE),
         dtype="bfloat16",
         quantization="bitsandbytes",
         load_format="bitsandbytes",
