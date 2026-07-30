@@ -9,7 +9,6 @@ SCHEMA_TYPE_ALIASES = {
     "integer": "number",
     "float": "number",
     "str": "string",
-    # This dataset uses call_drop_off_reason for one-of-many boolean flags.
     "call_drop_off_reason": "boolean",
 }
 
@@ -28,8 +27,6 @@ class FunctionCall(BaseModel):
 
 
 class VariableSpec(BaseModel):
-    """One field requested from the post-call extraction model."""
-
     name: str
     description: str
     type: str = "text"
@@ -39,7 +36,6 @@ class VariableSpec(BaseModel):
     @field_validator("name")
     @classmethod
     def strip_field_name(cls, value: str) -> str:
-        """Prevent invisible CSV/schema whitespace from creating new fields."""
         return value.strip()
 
     @field_validator("type")

@@ -33,9 +33,6 @@ _lora_request = LoRARequest(ADAPTER_NAME, ADAPTER_ID, str(ADAPTER_DIR))
 
 
 async def load_model() -> None:
-    """Call once at app startup. Starts the vLLM async engine, which handles
-    continuous batching of concurrent requests internally — no manual lock
-    needed, and no serialization of concurrent /extract calls."""
     global _engine, _tokenizer
     if _engine is not None:
         return
@@ -64,7 +61,6 @@ async def load_model() -> None:
 
 
 def shutdown_model() -> None:
-    """Stop the vLLM engine while FastAPI's event loop is still running."""
     global _engine, _tokenizer
     engine = _engine
     _engine = None
@@ -84,9 +80,6 @@ def shutdown_model() -> None:
 
 
 def _strip_think_block(text: str) -> Tuple[str, Optional[str]]:
-    """Removes a leading <think>...</think> block. Returns (remaining_text, thinking_or_None).
-    Also handles an unclosed <think> (generation cut off mid-thought) by treating
-    everything after the opening tag as thinking, with no answer recoverable."""
     match = re.search(r"<think>(.*?)</think>", text, flags=re.DOTALL)
     if match:
         thinking = match.group(1).strip()
@@ -173,7 +166,6 @@ async def _run_generation(
 def _validate_commented_result(
     result: dict, expected_fields: Optional[Sequence[str]]
 ) -> None:
-    """Require a model-generated value and evidence comment for every field."""
     if expected_fields is None:
         return
 
@@ -229,17 +221,6 @@ async def generate_extraction(
     max_retries: int = 1,
     expected_fields: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
-    """
-    Runs the model asynchronously, strips the <think> block, and parses JSON.
-    Retries generation (not just re-parsing) up to `max_retries` times on failure.
-
-    request_id must be unique per call — used by vLLM to track this request
-    within its internal batching/scheduling. Pass something like the job_id
-    from main.py, or add a suffix per retry attempt.
-
-    Returns result, optional thinking, and token/timing performance metadata.
-    Raises: ValueError if all attempts fail to produce valid JSON.
-    """
     last_error = None
     last_raw = None
     attempt_usage = []

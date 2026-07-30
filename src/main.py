@@ -33,7 +33,6 @@ logger = logging.getLogger("main")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load one shared vLLM engine before accepting requests."""
     try:
         await model_service.load_model()
         yield
@@ -53,7 +52,6 @@ def _remove_job(job_id: str) -> None:
 
 
 def _cleanup_jobs() -> None:
-    """Bound completed-job memory by age and count; never remove active jobs."""
     now = time.monotonic()
     for job_id, finished_at in list(JOB_FINISHED_AT.items()):
         if now - finished_at >= JOB_TTL_SECONDS:

@@ -1,5 +1,3 @@
-"""Add Node-server outcome fields to every row's `postcall` CSV schema."""
-
 import argparse
 import csv
 import json
@@ -38,7 +36,6 @@ def _outcome_fields(conversion_reason: str) -> list[dict[str, Any]]:
 def _upsert_outcome_fields(
     postcall_data: list[dict[str, Any]], conversion_reason: str
 ) -> list[dict[str, Any]]:
-    """Mirror JavaScript Map.set by replacing matching names in place."""
     result = list(postcall_data)
     index_by_name = {
         str(field.get("name", "")).strip(): index

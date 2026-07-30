@@ -1,4 +1,3 @@
-"""Shared vLLM runtime configuration for live and offline inference."""
 
 import json
 import os
@@ -48,7 +47,6 @@ if JOB_TTL_SECONDS <= 0 or MAX_COMPLETED_JOBS <= 0 or MAX_ACTIVE_JOBS <= 0:
 
 
 def validate_runtime_paths() -> None:
-    """Fail at startup if the adapter is missing or belongs to another base."""
     required_adapter_files = (
         ADAPTER_DIR / "adapter_config.json",
         ADAPTER_DIR / "adapter_model.safetensors",

@@ -1,10 +1,3 @@
-"""Concurrent benchmark for the live post-call extraction API.
-
-The benchmark submits a reproducible CSV sample with a bounded number of
-in-flight jobs, polls each job until completion, evaluates model results on the
-client, and writes aggregate, per-row, per-field, and raw-result artifacts.
-"""
-
 import argparse
 import csv
 import json
@@ -83,7 +76,6 @@ def _add_outcome_fields(
 
 
 def _build_payload(row: dict[str, str]) -> dict[str, Any]:
-    """Build the production request body; ground truth stays client-side."""
     schema = _add_outcome_fields(
         _json_cell(row, "postcall", []),
         row.get("conversion_reason", ""),

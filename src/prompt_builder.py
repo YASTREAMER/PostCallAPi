@@ -18,7 +18,6 @@ DESCRIPTION_HEAD_CHARS = 230
 
 
 def _shorten_description(description: str) -> str:
-    """Compact a rule without deleting its later conditions/exceptions."""
     description = re.sub(r"\s+", " ", description or "").strip()
     if not description:
         return "(no description provided)"

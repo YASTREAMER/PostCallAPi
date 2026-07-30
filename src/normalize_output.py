@@ -1,4 +1,3 @@
-"""Schema-aware normalization for model output returned by the live API."""
 
 import json
 import math
@@ -154,7 +153,6 @@ def normalize_boolean_defaults(
     model_output: dict,
     schema_fields: Union[Iterable[Any], Dict[str, str]],
 ) -> dict:
-    """Coerce every declared boolean field, including string booleans."""
     type_by_name = _field_type_map(schema_fields)
     default_by_name = _field_default_map(schema_fields)
     result = dict(model_output)
@@ -184,7 +182,6 @@ def normalize_model_output(
     model_output: dict,
     schema_fields: Union[Iterable[Any], Dict[str, str]],
 ) -> dict:
-    """Enforce requested fields, value/comment shape, and strict JSON types."""
     type_by_name = _field_type_map(schema_fields)
     default_by_name = _field_default_map(schema_fields)
     source = model_output if isinstance(model_output, dict) else {}

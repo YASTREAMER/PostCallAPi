@@ -1,19 +1,3 @@
-"""
-Offline batch evaluation using vLLM's batch generate — processes ALL prompts
-in one call instead of one row at a time, using vLLM's continuous batching
-for much higher throughput than a one-row-at-a-time loop.
-
-Uses vLLM's offline LLM class (not AsyncLLMEngine, which model_service.py
-uses for the live server) — this is the right tool for a one-shot batch job
-where all prompts are known up front.
-
-NOTE: don't run this at the same time as `uvicorn main:app` — each starts
-its own vLLM engine instance and claims GPU memory independently.
-
-Usage:
-    python evaluator.py --csv path/to/maybe.csv --test-size 0.2 --out report.csv
-"""
-
 from runtime_config import (
     ADAPTER_DIR,
     ADAPTER_ID,
