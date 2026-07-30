@@ -2,22 +2,22 @@ from runtime_config import (
     ADAPTER_DIR,
     ADAPTER_ID,
     ADAPTER_NAME,
+    ENABLE_PREFIX_CACHING,
     ENABLE_THINKING,
     GPU_MEMORY_UTILIZATION,
-    HF_HUB_CACHE,
     MAX_LORA_RANK,
     MAX_MODEL_LEN,
     MAX_NEW_TOKENS,
+    MIN_NEW_TOKENS,
+    TOKENS_PER_FIELD,
     MODEL_ID,
-    configure_runtime_cache,
     validate_runtime_paths,
 )
-
-configure_runtime_cache()
 
 import json
 import logging
 import re
+import time
 from typing import Any, Dict, Optional, Sequence, Tuple
 
 from vllm.lora.request import LoRARequest
@@ -42,20 +42,18 @@ async def load_model() -> None:
 
     validate_runtime_paths()
     logger.info(
-        "Starting vLLM AsyncLLMEngine for %s with adapter %s "
-        "(download_dir=%s) ...",
+        "Starting vLLM AsyncLLMEngine for %s with adapter %s ...",
         MODEL_ID,
         ADAPTER_DIR,
-        HF_HUB_CACHE,
     )
     engine_args = AsyncEngineArgs(
         model=MODEL_ID,
-        download_dir=str(HF_HUB_CACHE),
         dtype="bfloat16",
         quantization="bitsandbytes",
         load_format="bitsandbytes",
         gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         max_model_len=MAX_MODEL_LEN,
+        enable_prefix_caching=ENABLE_PREFIX_CACHING,
         enable_lora=True,
         max_loras=1,
         max_lora_rank=MAX_LORA_RANK,
@@ -132,14 +130,22 @@ def _build_prompt_text(prompt: str) -> str:
     )
 
 
-async def _run_generation(prompt: str, request_id: str) -> str:
+async def _run_generation(
+    prompt: str,
+    request_id: str,
+    requested_max_tokens: int,
+) -> Tuple[str, Dict[str, Any]]:
     text = _build_prompt_text(prompt)
+    prompt_token_ids = _tokenizer.encode(text)
+    available_tokens = max(1, MAX_MODEL_LEN - len(prompt_token_ids) - 32)
+    generation_limit = min(requested_max_tokens, available_tokens)
 
     sampling_params = SamplingParams(
         temperature=0.0,
-        max_tokens=MAX_NEW_TOKENS,
+        max_tokens=generation_limit,
     )
 
+    started = time.monotonic()
     final_output = None
     async for request_output in _engine.generate(
         text,
@@ -151,7 +157,17 @@ async def _run_generation(prompt: str, request_id: str) -> str:
 
     if final_output is None:
         raise RuntimeError("vLLM completed without returning a generation result")
-    return final_output.outputs[0].text
+
+    completion = final_output.outputs[0]
+    completion_token_ids = getattr(completion, "token_ids", None) or []
+    usage = {
+        "generation_seconds": round(time.monotonic() - started, 3),
+        "prompt_tokens": len(prompt_token_ids),
+        "completion_tokens": len(completion_token_ids),
+        "max_tokens": generation_limit,
+        "finish_reason": getattr(completion, "finish_reason", None),
+    }
+    return completion.text, usage
 
 
 def _validate_commented_result(
@@ -221,11 +237,21 @@ async def generate_extraction(
     within its internal batching/scheduling. Pass something like the job_id
     from main.py, or add a suffix per retry attempt.
 
-    Returns: {"result": <parsed dict>, "thinking": <str or None>}
+    Returns result, optional thinking, and token/timing performance metadata.
     Raises: ValueError if all attempts fail to produce valid JSON.
     """
     last_error = None
     last_raw = None
+    attempt_usage = []
+    field_count = len(expected_fields or ())
+    requested_max_tokens = (
+        min(
+            MAX_NEW_TOKENS,
+            max(MIN_NEW_TOKENS, 512 + TOKENS_PER_FIELD * field_count),
+        )
+        if field_count
+        else MAX_NEW_TOKENS
+    )
 
     for attempt in range(max_retries + 1):
         generation_prompt = (
@@ -233,15 +259,37 @@ async def generate_extraction(
             if attempt == 0 or expected_fields is None
             else _corrective_prompt(prompt, expected_fields)
         )
-        raw = await _run_generation(
-            generation_prompt, f"{request_id}-attempt{attempt}"
+        raw, usage = await _run_generation(
+            generation_prompt,
+            f"{request_id}-attempt{attempt}",
+            requested_max_tokens,
         )
+        usage["attempt"] = attempt + 1
+        attempt_usage.append(usage)
         last_raw = raw
         answer_text, thinking = _strip_think_block(raw)
         try:
             parsed = _extract_json(answer_text)
             _validate_commented_result(parsed, expected_fields)
-            return {"result": parsed, "thinking": thinking}
+            performance = {
+                "attempts": attempt + 1,
+                "retried": attempt > 0,
+                "generation_seconds": round(
+                    sum(item["generation_seconds"] for item in attempt_usage), 3
+                ),
+                "prompt_tokens": sum(
+                    item["prompt_tokens"] for item in attempt_usage
+                ),
+                "completion_tokens": sum(
+                    item["completion_tokens"] for item in attempt_usage
+                ),
+                "attempt_details": attempt_usage,
+            }
+            return {
+                "result": parsed,
+                "thinking": thinking,
+                "performance": performance,
+            }
         except (ValueError, json.JSONDecodeError) as e:
             last_error = e
             logger.warning(

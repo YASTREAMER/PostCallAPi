@@ -20,21 +20,18 @@ from runtime_config import (
     ADAPTER_NAME,
     ENABLE_THINKING,
     GPU_MEMORY_UTILIZATION,
-    HF_HUB_CACHE,
     MAX_LORA_RANK,
     MAX_MODEL_LEN,
     MAX_NEW_TOKENS,
     MODEL_ID,
-    configure_runtime_cache,
     validate_runtime_paths,
 )
-
-configure_runtime_cache()
 
 import argparse
 import json
 import re
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 from sklearn.model_selection import train_test_split
@@ -64,6 +61,60 @@ DISPOSITION_REASON_DESCRIPTION = (
     "Briefly state the primary call outcome and why the user did or did not "
     "convert, using evidence from the transcript and call context."
 )
+
+
+def _boolean_label(value):
+    """Return a real boolean only for explicit true/false report values."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized == "true":
+            return True
+        if normalized == "false":
+            return False
+    return None
+
+
+def _build_boolean_metrics(report_df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    categorical = report_df[report_df["category"] == "categorical"]
+    for field_name, group in categorical.groupby("field_name"):
+        truths = group["truth_value"].map(_boolean_label)
+        if truths.isna().any():
+            continue
+
+        predictions = group["model_value"].map(_boolean_label)
+        positive = truths == True  # noqa: E712 - intentional pandas comparison
+        negative = truths == False  # noqa: E712
+        tp = int(((predictions == True) & positive).sum())  # noqa: E712
+        fn = int(((predictions != True) & positive).sum())  # noqa: E712
+        tn = int(((predictions == False) & negative).sum())  # noqa: E712
+        fp = int(((predictions != False) & negative).sum())  # noqa: E712
+        recall = tp / (tp + fn) if tp + fn else None
+        specificity = tn / (tn + fp) if tn + fp else None
+        balanced_accuracy = (
+            (recall + specificity) / 2
+            if recall is not None and specificity is not None
+            else None
+        )
+        rows.append(
+            {
+                "field_name": field_name,
+                "n": len(group),
+                "positive_support": int(positive.sum()),
+                "negative_support": int(negative.sum()),
+                "tp": tp,
+                "fn": fn,
+                "tn": tn,
+                "fp": fp,
+                "positive_recall": recall,
+                "specificity": specificity,
+                "balanced_accuracy": balanced_accuracy,
+                "accuracy": float(group["match"].mean()),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _add_evaluation_fields(postcall_data: list, row: pd.Series) -> list:
@@ -178,10 +229,8 @@ def main():
         type=str,
         default=None,
         help=(
-            "Path for this run's summary log. Defaults to a timestamped "
-            "filename (eval_summary_<YYYYMMDD_HHMMSS>.log) so runs never "
-            "overwrite or mix with each other. Pass an explicit path if "
-            "you want a fixed name instead."
+            "Path for this run's evaluation log. By default it is written "
+            "beside --out with the same stem and a .log extension."
         ),
     )
     args = parser.parse_args()
@@ -190,13 +239,16 @@ def main():
         parser.error("--gpu-memory-utilization must be greater than 0 and at most 1")
 
     run_start = datetime.now()
-    log_file = args.log_file or f"eval_summary_{run_start.strftime('%Y%m%d_%H%M%S')}.log"
+    report_path = Path(args.out)
+    log_path = (
+        Path(args.log_file)
+        if args.log_file
+        else report_path.with_suffix(".log")
+    )
 
     validate_runtime_paths()
     lora_request = LoRARequest(ADAPTER_NAME, ADAPTER_ID, str(ADAPTER_DIR))
-    print(
-        f"Loading vLLM engine for {MODEL_ID} with adapter {ADAPTER_DIR} "
-    )
+    print(f"Loading vLLM engine for {MODEL_ID} with adapter {ADAPTER_DIR} ...")
     llm = LLM(
         model=MODEL_ID,
         dtype="bfloat16",
@@ -273,6 +325,8 @@ def main():
 
     report_rows = []
     skipped_fields_seen = set()
+    invalid_ground_truth_counts = {}
+    successfully_scored_rows = 0
 
     for i, output in zip(row_indices, outputs):
         row = test_df.loc[i]
@@ -306,9 +360,15 @@ def main():
             json.loads(row["post_call_detail"]) if pd.notna(row["post_call_detail"]) else {}
         )
 
+        row_had_score = False
         for field_name in schema_names:
             truth_val = evaluation.extract_value(ground_truth, field_name)
             if truth_val == "<missing>":
+                continue
+            if evaluation.should_skip_ground_truth(field_name, truth_val):
+                invalid_ground_truth_counts[field_name] = (
+                    invalid_ground_truth_counts.get(field_name, 0) + 1
+                )
                 continue
             spec_type = spec_type_by_name.get(field_name, "text")
             model_val = evaluation.extract_value(model_output, field_name)
@@ -319,6 +379,10 @@ def main():
                 "field_name": field_name,
                 **field_score,
             })
+            row_had_score = True
+
+        if row_had_score:
+            successfully_scored_rows += 1
 
         for key in ground_truth.keys():
             if key not in schema_names:
@@ -329,10 +393,28 @@ def main():
         return
 
     report_df = pd.DataFrame(report_rows)
-    report_df.to_csv(args.out, index=False)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_df.to_csv(report_path, index=False)
 
     categorical_df = report_df[report_df["category"] == "categorical"]
     text_df = report_df[report_df["category"] == "text"]
+    nonempty_text_df = text_df[
+        ~text_df["truth_value"].map(evaluation._is_empty)
+    ]
+    per_field = (
+        report_df.groupby(["field_name", "category"])
+        .agg(
+            samples=("score", "size"),
+            average_score=("score", "mean"),
+            match_rate=("match", "mean"),
+        )
+        .sort_values(["match_rate", "average_score"])
+    )
+    boolean_metrics = _build_boolean_metrics(report_df)
+    boolean_metrics_path = report_path.with_name(
+        f"{report_path.stem}_boolean_metrics.csv"
+    )
+    boolean_metrics.to_csv(boolean_metrics_path, index=False)
 
     summary_lines = []
     summary_lines.append(f"Run timestamp:          {run_start.isoformat()}")
@@ -343,23 +425,68 @@ def main():
     summary_lines.append("=" * 60)
     summary_lines.append("EVALUATION SUMMARY")
     summary_lines.append("=" * 60)
-    summary_lines.append(f"Rows evaluated:        {len(row_indices) - error_count} / {len(test_df)} ({error_count} errored/skipped)")
+    summary_lines.append(f"Rows evaluated:        {successfully_scored_rows} / {len(test_df)} ({error_count} errored/skipped)")
     summary_lines.append(f"Categorical/boolean:   {categorical_df['score'].mean():.3f}  (n={len(categorical_df)})")
     summary_lines.append(f"Free text (fuzzy):     {text_df['score'].mean():.3f}  (n={len(text_df)})")
+    summary_lines.append(
+        f"Non-empty free text:   {nonempty_text_df['score'].mean():.3f}  "
+        f"(match={nonempty_text_df['match'].mean():.3f}, "
+        f"n={len(nonempty_text_df)})"
+    )
     summary_lines.append(f"Mixture (overall):     {report_df['score'].mean():.3f}  (n={len(report_df)})")
+    summary_lines.append(
+        f"Macro field match:     {per_field['match_rate'].mean():.3f}  "
+        f"(fields={len(per_field)})"
+    )
     summary_lines.append("")
-    summary_lines.append("Per-field average score:")
-    summary_lines.append(report_df.groupby(["field_name", "category"])["score"].mean().sort_values().to_string())
+    summary_lines.append("Per-field metrics:")
+    summary_lines.append(per_field.to_string())
+    if not boolean_metrics.empty:
+        summary_lines.append("\nBoolean fields with both truth classes:")
+        two_class = boolean_metrics[
+            (boolean_metrics["positive_support"] > 0)
+            & (boolean_metrics["negative_support"] > 0)
+        ].sort_values("balanced_accuracy")
+        summary_lines.append(
+            two_class[
+                [
+                    "field_name",
+                    "positive_support",
+                    "negative_support",
+                    "positive_recall",
+                    "specificity",
+                    "balanced_accuracy",
+                    "accuracy",
+                ]
+            ].to_string(index=False)
+            if not two_class.empty
+            else "(none in this sample)"
+        )
+    if invalid_ground_truth_counts:
+        summary_lines.append(
+            "\nInvalid ground-truth labels skipped: "
+            f"{invalid_ground_truth_counts}"
+        )
     if skipped_fields_seen:
         summary_lines.append(f"\nGround-truth fields NOT in schema (not scored): {sorted(skipped_fields_seen)}")
-    summary_lines.append(f"\nFull report written to: {args.out}")
-    summary_lines.append(f"Summary log written to: {log_file}")
+    summary_lines.append(f"\nFull report written to: {report_path}")
+    summary_lines.append(f"Boolean metrics written to: {boolean_metrics_path}")
+    summary_lines.append(f"Evaluation log written to: {log_path}")
 
     summary_text = "\n".join(summary_lines)
     print("\n" + summary_text)
 
-    with open(log_file, "w", encoding="utf-8") as f:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    mismatch_df = report_df[~report_df["match"]]
+    with log_path.open("w", encoding="utf-8") as f:
         f.write(summary_text + "\n")
+        f.write("\n" + "=" * 60 + "\n")
+        f.write("MISMATCH DETAILS\n")
+        f.write("=" * 60 + "\n")
+        if mismatch_df.empty:
+            f.write("No mismatches.\n")
+        else:
+            f.write(mismatch_df.to_string(index=False) + "\n")
 
 
 if __name__ == "__main__":

@@ -3,3 +3,5 @@ src/eval_csv
 src/eval_log
 data/
 adapter/
+eval_csv/
+output/

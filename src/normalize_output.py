@@ -1,143 +1,220 @@
-"""
-Post-processing normalizer: coerces empty/missing boolean-field values to
-an explicit `false`, matching your own TASK_INSTRUCTIONS contract
-("If a boolean variable is not present, assign it the value false.").
+"""Schema-aware normalization for model output returned by the live API."""
 
-The model already knows this rule -- it's in the prompt every single call
--- it just doesn't reliably execute it for low-salience / rarely-true
-fields (things like Address_verification_required, alternate_contact_number,
-etc., which are almost always false in your data). This closes that gap
-deterministically instead of requiring a retrain.
-
-Two places to use it:
-
-  1. evaluator.py -- right after _extract_json(...) and before scoring,
-     so eval numbers reflect real prediction accuracy instead of the
-     empty-vs-false formatting artifact. See wiring notes at the bottom
-     of this file.
-
-  2. The live serving path (model_service.py) -- right before the
-     response is returned to the node server, so production output
-     matches the documented contract even on the calls where the model
-     itself doesn't fill it in. This is the one that actually matters
-     for users -- the eval-side fix just lets you measure correctly.
-
-Deliberately reuses evaluation._is_empty / evaluation._normalize_value
-instead of redefining "what counts as empty" here. If you ever change
-that definition in evaluation.py, this file picks it up automatically --
-there's no second copy of that logic to drift out of sync.
-"""
-
+import json
+import math
+import re
 from typing import Any, Dict, Iterable, Union
 
-from evaluation import _is_empty  # reuse -- see module docstring
+from evaluation import _is_empty
+from schemas import normalize_schema_type
 
 DEFAULTED_COMMENT = "<auto-defaulted: field not mentioned in call>"
 MISSING_COMMENT = "Model did not provide supporting evidence for this value."
 MISSING_FIELD_COMMENT = "Model did not return this field."
 
+_TRUE_STRINGS = {"1", "true", "yes", "y", "on"}
+_FALSE_STRINGS = {
+    "0",
+    "0.0",
+    "false",
+    "no",
+    "n",
+    "off",
+    "none",
+    "null",
+    "n/a",
+    "na",
+    "",
+}
+_NUMBER_PATTERN = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$")
 
-def _field_type_map(schema_fields: Union[Iterable[Any], Dict[str, str]]) -> Dict[str, str]:
-    """schema_fields can be req.postcall_data (objects with .name/.type,
-    as used in evaluator.py), a list of dicts with 'name'/'type' keys
-    (as parsed straight from the postcall CSV column), or an existing
-    {name: type} map (e.g. evaluator.py's spec_type_by_name)."""
+
+def _field_type_map(
+    schema_fields: Union[Iterable[Any], Dict[str, str]],
+) -> Dict[str, str]:
     if isinstance(schema_fields, dict):
-        return schema_fields
-    out = {}
-    for f in schema_fields:
-        if isinstance(f, dict):
-            out[f["name"]] = f.get("type", "text")
+        return {
+            str(name).strip(): normalize_schema_type(spec_type)
+            for name, spec_type in schema_fields.items()
+        }
+
+    result = {}
+    for field in schema_fields:
+        if isinstance(field, dict):
+            name = str(field["name"]).strip()
+            spec_type = field.get("type", "text")
         else:
-            out[f.name] = getattr(f, "type", "text")
-    return out
+            name = field.name.strip()
+            spec_type = getattr(field, "type", "text")
+        result[name] = normalize_schema_type(spec_type)
+    return result
+
+
+def _field_default_map(
+    schema_fields: Union[Iterable[Any], Dict[str, str]],
+) -> Dict[str, Any]:
+    if isinstance(schema_fields, dict):
+        return {}
+
+    defaults = {}
+    for field in schema_fields:
+        if isinstance(field, dict):
+            if "defaultValue" in field:
+                defaults[str(field["name"]).strip()] = field["defaultValue"]
+            continue
+
+        if "defaultValue" in getattr(field, "model_fields_set", set()):
+            defaults[field.name.strip()] = getattr(field, "defaultValue", None)
+    return defaults
+
+
+def _default_for_type(spec_type: str, configured_default: Any) -> Any:
+    if configured_default is not None:
+        return configured_default
+    if spec_type == "boolean":
+        return False
+    if spec_type == "number":
+        return 0
+    if spec_type in {"text", "string", "selector", "categorical"}:
+        return ""
+    return configured_default
+
+
+def _coerce_boolean(value: Any, default: Any = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if value == 1:
+            return True
+        if value == 0 or (isinstance(value, float) and math.isnan(value)):
+            return False
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in _TRUE_STRINGS:
+            return True
+        if normalized in _FALSE_STRINGS:
+            return False
+    return default if isinstance(default, bool) else False
+
+
+def _coerce_number(value: Any, default: Any = 0) -> int | float:
+    if isinstance(value, bool):
+        value = int(value)
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and math.isnan(value):
+            value = default
+        else:
+            return value
+    if isinstance(value, str):
+        normalized = value.strip().replace(",", "")
+        if _NUMBER_PATTERN.fullmatch(normalized):
+            parsed = float(normalized) if "." in normalized else int(normalized)
+            return parsed
+    if isinstance(default, (int, float)) and not isinstance(default, bool):
+        return default
+    return 0
+
+
+def _coerce_string(value: Any, default: Any = "") -> str:
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return default if isinstance(default, str) else ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return str(value)
+
+
+def coerce_value_for_type(value: Any, spec_type: str, default: Any = None) -> Any:
+    """Return a JSON value that conforms to the requested schema type."""
+    spec_type = normalize_schema_type(spec_type)
+    effective_default = _default_for_type(spec_type, default)
+    if spec_type == "boolean":
+        return _coerce_boolean(value, effective_default)
+    if spec_type == "number":
+        return _coerce_number(value, effective_default)
+    if spec_type in {"text", "string", "selector", "categorical"}:
+        return _coerce_string(value, effective_default)
+    return value if value is not None else effective_default
+
+
+def value_matches_type(value: Any, spec_type: str) -> bool:
+    """Strict JSON type check used by the benchmark."""
+    spec_type = normalize_schema_type(spec_type)
+    if spec_type == "boolean":
+        return isinstance(value, bool)
+    if spec_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if spec_type in {"text", "string", "selector", "categorical"}:
+        return isinstance(value, str)
+    return True
 
 
 def normalize_boolean_defaults(
-    model_output: dict, schema_fields: Union[Iterable[Any], Dict[str, str]]
+    model_output: dict,
+    schema_fields: Union[Iterable[Any], Dict[str, str]],
 ) -> dict:
-    """Returns a NEW dict (does not mutate model_output) where every
-    schema field declared type=='boolean' whose value is empty or
-    missing gets coerced to explicit False, preserving the
-    {"value": ..., "comment": ...} shape your contract expects.
-
-    Non-boolean fields, and boolean fields the model already gave an
-    explicit (non-empty) value for, pass through completely unchanged --
-    this only touches the specific empty-boolean case."""
+    """Coerce every declared boolean field, including string booleans."""
     type_by_name = _field_type_map(schema_fields)
-    result = dict(model_output)  # shallow copy -- only top-level keys we touch are replaced
+    default_by_name = _field_default_map(schema_fields)
+    result = dict(model_output)
 
     for name, spec_type in type_by_name.items():
         if spec_type != "boolean":
             continue
-
-        entry = result.get(name, "<missing>")
-        current_value = entry.get("value", "<missing>") if isinstance(entry, dict) else entry
-
-        if not _is_empty(current_value):
-            continue  # model already gave an explicit value here -- leave it alone
-
+        entry = result.get(name)
+        value = entry.get("value") if isinstance(entry, dict) else entry
+        coerced = _coerce_boolean(value, default_by_name.get(name, False))
         if isinstance(entry, dict):
-            new_entry = dict(entry)
-            new_entry["value"] = False
-            if _is_empty(new_entry.get("comment")):
-                new_entry["comment"] = DEFAULTED_COMMENT
+            normalized_entry = dict(entry)
+            normalized_entry["value"] = coerced
+            if _is_empty(normalized_entry.get("comment")):
+                normalized_entry["comment"] = DEFAULTED_COMMENT
         else:
-            new_entry = {"value": False, "comment": DEFAULTED_COMMENT}
-
-        result[name] = new_entry
+            normalized_entry = {
+                "value": coerced,
+                "comment": DEFAULTED_COMMENT,
+            }
+        result[name] = normalized_entry
 
     return result
 
 
 def normalize_model_output(
-    model_output: dict, schema_fields: Union[Iterable[Any], Dict[str, str]]
+    model_output: dict,
+    schema_fields: Union[Iterable[Any], Dict[str, str]],
 ) -> dict:
-    """Apply all schema-aware normalization and enforce value/comment objects."""
+    """Enforce requested fields, value/comment shape, and strict JSON types."""
     type_by_name = _field_type_map(schema_fields)
-    result = normalize_boolean_defaults(model_output, type_by_name)
+    default_by_name = _field_default_map(schema_fields)
+    source = model_output if isinstance(model_output, dict) else {}
+    normalized: dict[str, dict[str, Any]] = {}
 
-    # Match Data.csv's post_call_detail contract for every requested field:
-    # {"field": {"value": ..., "comment": "supporting call evidence"}}.
     for name, spec_type in type_by_name.items():
-        if name not in result:
-            result[name] = {
-                "value": False if spec_type == "boolean" else "",
-                "comment": MISSING_FIELD_COMMENT,
-            }
-            continue
+        configured_default = default_by_name.get(name)
+        entry = source.get(name)
+        missing = name not in source
 
-        entry = result[name]
-        if not isinstance(entry, dict):
-            result[name] = {
-                "value": entry,
-                "comment": MISSING_COMMENT,
-            }
-            continue
+        if isinstance(entry, dict):
+            value = entry.get("value")
+            comment = entry.get("comment")
+        else:
+            value = entry
+            comment = None
 
-        new_entry = dict(entry)
-        if "value" not in new_entry:
-            new_entry["value"] = False if spec_type == "boolean" else ""
-        if _is_empty(new_entry.get("comment")):
-            new_entry["comment"] = MISSING_COMMENT
-        result[name] = new_entry
+        coerced_value = coerce_value_for_type(
+            value,
+            spec_type,
+            configured_default,
+        )
+        if _is_empty(comment):
+            comment = MISSING_FIELD_COMMENT if missing else MISSING_COMMENT
+        elif not isinstance(comment, str):
+            comment = _coerce_string(comment)
 
-    # The output contract allows only requested schema fields at the top level.
-    return {name: result[name] for name in type_by_name}
+        normalized[name] = {
+            "value": coerced_value,
+            "comment": comment,
+        }
 
-
-# --------------------------------------------------------------------------
-# Wiring into evaluator.py: in the per-row loop, right after
-# `model_output = _extract_json(answer_text)` succeeds, add:
-#
-#     from normalize_output import normalize_boolean_defaults
-#     model_output = normalize_boolean_defaults(model_output, req.postcall_data)
-#
-# Everything downstream (schema_names, spec_type_by_name, the scoring loop)
-# stays exactly as-is -- normalize_boolean_defaults just cleans model_output
-# before evaluation.score_field ever sees it.
-#
-# Wiring into the live server (model_service.py): apply the same call
-# right before the response dict is returned/serialized, using whatever
-# variable holds the parsed model JSON and the request's postcall_data.
-# --------------------------------------------------------------------------
+    return normalized

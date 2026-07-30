@@ -1,9 +1,11 @@
 from fuzzywuzzy import fuzz
 import difflib
 import json
+import math
 import re as _re
 import threading
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Iterable
 
 EVAL_LOG_PATH = "eval_log/eval_logs.jsonl"
@@ -19,6 +21,24 @@ _EMPTY_VALUES = (None, "<missing>", "")
 # Values a categorical ground-truth field uses as a "0"/null sentinel in some
 # source data (e.g. alternate_contact_number = "0" meaning none given).
 _ZERO_SENTINEL_STRINGS = ("0", "0.0")
+
+# Field-agnostic labels meaning that a categorical/selector value is absent.
+# These are formatting sentinels, not semantic conversion-status phrases.
+_CATEGORICAL_EMPTY_LABELS = {
+    "n/a",
+    "na",
+    "nil",
+    "none",
+    "null",
+    "not applicable",
+    "not available",
+    "not provided",
+    "not specified",
+    "unavailable",
+}
+
+_VALID_USER_SENTIMENT_VALUES = {"positive", "negative", "neutral"}
+
 
 def _normalize_value(v):
     """Strips accidental double-JSON-encoding and normalizes common formatting
@@ -37,10 +57,18 @@ def _normalize_value(v):
 
 def _is_empty(v) -> bool:
     """True if v represents 'nothing extracted' — None, the missing sentinel,
-    empty string, or a quoted empty string like '""' that normalizes to ''."""
+    empty string, NaN, or a quoted empty string like '""'."""
+    if isinstance(v, float) and math.isnan(v):
+        return True
     if v in _EMPTY_VALUES:
         return True
     return _normalize_value(v) == ""
+
+
+def _is_categorical_empty_label(v) -> bool:
+    if not isinstance(v, str):
+        return False
+    return _normalize_value(v).casefold() in _CATEGORICAL_EMPTY_LABELS
 
 
 def extract_value(d: dict, key: str):
@@ -69,16 +97,30 @@ def classify_field(spec_type: str, ground_truth_value) -> str:
 
 
 def zero_ground_truth_to_false(spec_type: str, truth_val):
-    category = classify_field(spec_type, truth_val)
-    if category != "categorical":
-        return truth_val
     if isinstance(truth_val, bool):
         return truth_val  # already boolean, nothing to do
+    # Only boolean/categorical schema fields use zero as a False sentinel.
+    # Numeric fields such as pincode and alternate_contact_number use 0 as
+    # their actual configured default and must remain numeric.
+    if spec_type not in {"boolean", "categorical"}:
+        return truth_val
     if isinstance(truth_val, (int, float)) and truth_val == 0:
         return False
     if isinstance(truth_val, str) and truth_val.strip() in _ZERO_SENTINEL_STRINGS:
         return False
     return truth_val
+
+
+def should_skip_ground_truth(field_name: str, truth_val) -> bool:
+    """Skip known-invalid labels rather than scoring them as model errors."""
+    if field_name.strip().casefold() != "user_sentiment":
+        return False
+    if _is_empty(truth_val):
+        return True
+    return (
+        _normalize_value(truth_val).casefold()
+        not in _VALID_USER_SENTIMENT_VALUES
+    )
 
 
 def score_categorical(model_val, truth_val) -> float:
@@ -128,15 +170,27 @@ def score_field(spec_type: str, model_val, truth_val) -> Dict[str, Any]:
     truth_val = zero_ground_truth_to_false(spec_type, truth_val)
     category = classify_field(spec_type, truth_val)
 
-    # Empty categorical ground truths use the same negative/false convention
-    # as numeric zero sentinels.
-    if category == "categorical" and _is_empty(truth_val):
+    # Empty categorical ground truths and common no-value labels use the same
+    # False representation.
+    if category == "categorical" and (
+        _is_empty(truth_val) or _is_categorical_empty_label(truth_val)
+    ):
         truth_val = False
 
-    # Empty categorical predictions represent a negative/false value. Do this
-    # before scoring so the score, match flag, and reported model value agree.
-    if category == "categorical" and _is_empty(model_val):
+    # Apply the same representation to model-side categorical absence labels.
+    if category == "categorical" and (
+        _is_empty(model_val) or _is_categorical_empty_label(model_val)
+    ):
         model_val = False
+
+    # For optional free-text fields, model labels such as "N/A" and "none"
+    # mean the same thing as an explicitly empty ground-truth value.
+    if (
+        category == "text"
+        and _is_empty(truth_val)
+        and _is_categorical_empty_label(model_val)
+    ):
+        model_val = ""
 
     score = (
         score_categorical(model_val, truth_val)
@@ -168,6 +222,8 @@ def evaluate_output(
         truth_val = extract_value(ground_truth, field_name)
         if truth_val == "<missing>":
             continue  # node didn't provide ground truth for this field — skip, don't penalize
+        if should_skip_ground_truth(field_name, truth_val):
+            continue
         model_val = extract_value(model_output, field_name)
         field_results[field_name] = score_field(
             spec_type_by_name.get(field_name, "text"), model_val, truth_val
@@ -210,6 +266,10 @@ def log_evaluation(
         "model_output": model_output,
         "eval_result": eval_result,
     }
+    destination = Path(log_path)
+    if not destination.is_absolute():
+        destination = Path(__file__).resolve().parent / destination
     with _LOG_LOCK:
-        with open(f"eval_csv/{log_path}", "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
