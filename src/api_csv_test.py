@@ -312,7 +312,7 @@ def _bounded_int(name: str, minimum: int, maximum: int):
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Submit up to 500 CSV rows to the live API concurrently and save "
+            "Submit up to 10000 CSV rows to the live API concurrently and save "
             "latency, throughput, accuracy, per-field scores, and raw results."
         )
     )
@@ -321,7 +321,7 @@ def _parse_args() -> argparse.Namespace:
         "--count",
         type=_bounded_int("count", 1, MAX_ROWS),
         default=200,
-        help="Number of rows to test (default: 200; maximum: 500).",
+        help="Number of rows to test (default: 200; maximum: 10000).",
     )
     parser.add_argument(
         "--concurrency",
@@ -336,11 +336,19 @@ def _parse_args() -> argparse.Namespace:
         help="Choose a seeded random sample or the first N rows.",
     )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--api-url", default="http://127.0.0.1:8000")
+    parser.add_argument("--api-url", default="http://127.0.0.1:8088/postcall")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--poll-interval", type=float, default=1.0)
     parser.add_argument("--job-timeout", type=float, default=1200.0)
     parser.add_argument("--request-timeout", type=float, default=60.0)
+    parser.add_argument(
+        "--no-evaluation",
+        action="store_true",
+        help=(
+            "Production stress mode: skip client-side ground-truth scoring and "
+            "store complete API responses with model comments."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -353,6 +361,7 @@ def _process_case(
     poll_interval: float,
     job_timeout: float,
     request_timeout: float,
+    evaluate: bool,
 ) -> dict[str, Any]:
     started_at = datetime.now(timezone.utc).isoformat()
     started = time.monotonic()
@@ -369,7 +378,8 @@ def _process_case(
 
     try:
         payload = _build_payload(row)
-        ground_truth = _json_cell(row, "post_call_detail", {})
+        if evaluate:
+            ground_truth = _json_cell(row, "post_call_detail", {})
         submit_started = time.monotonic()
         accepted = _request_json(
             "POST",
@@ -389,7 +399,7 @@ def _process_case(
         status = str(response.get("status", "unknown"))
         error = str(response.get("error") or "")
         model_result = response.get("result")
-        if status == "done" and isinstance(model_result, dict):
+        if evaluate and status == "done" and isinstance(model_result, dict):
             evaluation_result = _evaluate_result(
                 payload,
                 model_result,
@@ -526,6 +536,21 @@ def _field_reports(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rows
 
 
+def _full_response_report(result: dict[str, Any]) -> dict[str, Any]:
+    """Keep the complete nested production result in deterministic row order."""
+    response = result.get("final_response") or {}
+    return {
+        "position": result["position"],
+        "row_index": result["row_index"],
+        "versionId": result["versionId"],
+        "job_id": result["job_id"],
+        "status": result["status"],
+        "error": result["error"],
+        "result": response.get("result"),
+        "performance": response.get("performance"),
+    }
+
+
 def _build_summary(
     *,
     args: argparse.Namespace,
@@ -605,6 +630,8 @@ def _build_summary(
         "output_directory": str(output_dir),
         "selection": args.selection,
         "seed": args.seed,
+        "mode": "production_stress" if args.no_evaluation else "evaluation",
+        "evaluation_enabled": not args.no_evaluation,
         "selected_indices": selected_indices,
         "requested_rows": args.count,
         "concurrency": min(args.concurrency, args.count),
@@ -668,7 +695,8 @@ def _build_summary(
         "failed_row_indices": [result["row_index"] for result in failed],
         "artifacts": {
             "per_row": "rows.csv",
-            "per_field": "field_scores.csv",
+            "per_field": None if args.no_evaluation else "field_scores.csv",
+            "full_responses": "responses.jsonl",
             "raw_results": "results.jsonl",
             "summary": "summary.json",
         },
@@ -701,7 +729,8 @@ def main() -> None:
         )
 
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    output_dir = args.output_root.resolve() / f"api_test_{run_id}"
+    run_prefix = "api_stress" if args.no_evaluation else "api_test"
+    output_dir = args.output_root.resolve() / f"{run_prefix}_{run_id}"
     output_dir.mkdir(parents=True, exist_ok=False)
     workers = min(args.concurrency, args.count)
 
@@ -724,6 +753,7 @@ def main() -> None:
                 poll_interval=args.poll_interval,
                 job_timeout=args.job_timeout,
                 request_timeout=args.request_timeout,
+                evaluate=not args.no_evaluation,
             ): (position, row_index)
             for position, row_index in enumerate(selected_indices, start=1)
         }
@@ -740,10 +770,15 @@ def main() -> None:
                 observed_completion_tokens, elapsed_wall
             )
             with _PRINT_LOCK:
+                accuracy_text = (
+                    f" accuracy={result['accuracy']}"
+                    if not args.no_evaluation
+                    else ""
+                )
                 print(
                     f"[{completed_count}/{args.count}] row={result['row_index']} "
                     f"status={result['status']} time={result['end_to_end_seconds']}s "
-                    f"accuracy={result['accuracy']} "
+                    f"{accuracy_text} "
                     f"output_tokens={result['completion_tokens']} "
                     f"job_output_tpm={result['completion_tokens_per_minute']} "
                     f"wall_output_tpm={wall_tpm}"
@@ -793,24 +828,29 @@ def main() -> None:
             "error",
         ],
     )
-    _write_csv(
-        output_dir / "field_scores.csv",
-        field_reports,
-        fieldnames=[
-            "position",
-            "row_index",
-            "versionId",
-            "field_name",
-            "category",
-            "model_value",
-            "truth_value",
-            "score",
-            "match",
-            "schema_type",
-            "type_valid",
-            "strict_match",
-            "meaningful_truth",
-        ],
+    if not args.no_evaluation:
+        _write_csv(
+            output_dir / "field_scores.csv",
+            field_reports,
+            fieldnames=[
+                "position",
+                "row_index",
+                "versionId",
+                "field_name",
+                "category",
+                "model_value",
+                "truth_value",
+                "score",
+                "match",
+                "schema_type",
+                "type_valid",
+                "strict_match",
+                "meaningful_truth",
+            ],
+        )
+    _write_jsonl(
+        output_dir / "responses.jsonl",
+        [_full_response_report(result) for result in results],
     )
     _write_jsonl(output_dir / "results.jsonl", results)
     _write_json(output_dir / "summary.json", summary)

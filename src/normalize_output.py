@@ -4,7 +4,6 @@ import math
 import re
 from typing import Any, Dict, Iterable, Union
 
-from evaluation import _is_empty
 from schemas import normalize_schema_type
 
 DEFAULTED_COMMENT = "<auto-defaulted: field not mentioned in call>"
@@ -26,6 +25,24 @@ _FALSE_STRINGS = {
     "",
 }
 _NUMBER_PATTERN = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$")
+
+
+def _is_empty(value: Any) -> bool:
+    """Return whether a model value represents missing output."""
+    if value is None:
+        return True
+    if isinstance(value, float) and math.isnan(value):
+        return True
+    if isinstance(value, str):
+        normalized = value.strip()
+        while (
+            len(normalized) >= 2
+            and normalized[0] == '"'
+            and normalized[-1] == '"'
+        ):
+            normalized = normalized[1:-1].strip()
+        return normalized in {"", "<missing>"}
+    return value == "<missing>"
 
 
 def _field_type_map(

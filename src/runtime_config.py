@@ -25,7 +25,8 @@ ENABLE_PREFIX_CACHING = os.environ.get(
 ).strip().casefold() in {"1", "true", "yes", "on"}
 
 API_HOST = os.environ.get("POSTCALL_API_HOST", "0.0.0.0")
-API_PORT = int(os.environ.get("POSTCALL_API_PORT", "8000"))
+API_PORT = int(os.environ.get("POSTCALL_API_PORT", "8088"))
+API_PREFIX = os.environ.get("POSTCALL_API_PREFIX", "/postcall").strip()
 JOB_TTL_SECONDS = float(os.environ.get("POSTCALL_JOB_TTL_SECONDS", "3600"))
 MAX_COMPLETED_JOBS = int(os.environ.get("POSTCALL_MAX_COMPLETED_JOBS", "10000"))
 MAX_ACTIVE_JOBS = int(os.environ.get("POSTCALL_MAX_ACTIVE_JOBS", "100"))
@@ -36,6 +37,14 @@ if not 0 < GPU_MEMORY_UTILIZATION <= 1:
     )
 if not 1 <= API_PORT <= 65535:
     raise ValueError("POSTCALL_API_PORT must be between 1 and 65535")
+if (
+    not API_PREFIX.startswith("/")
+    or API_PREFIX == "/"
+    or API_PREFIX.endswith("/")
+):
+    raise ValueError(
+        "POSTCALL_API_PREFIX must start with / and must not end with /"
+    )
 if not 0 < MIN_NEW_TOKENS <= MAX_NEW_TOKENS:
     raise ValueError("VLLM token limits must satisfy 0 < MIN <= MAX")
 if TOKENS_PER_FIELD <= 0:

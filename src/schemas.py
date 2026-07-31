@@ -55,9 +55,6 @@ class ExtractRequest(BaseModel):
 
     timezone: str = "Asia/Kolkata"
 
-    # Optional and intended only for evaluation clients.
-    ground_truth: Optional[Dict[str, Any]] = None
-
 
 class JobStatus(str, Enum):
     PENDING = "pending"
@@ -72,7 +69,6 @@ class JobRecord(BaseModel):
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
     raw_thinking: Optional[str] = None
-    eval_result: Optional[Dict[str, Any]] = None
     performance: Optional[Dict[str, Any]] = None
 
 
@@ -86,5 +82,4 @@ class StatusResponse(BaseModel):
     status: JobStatus
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
-    eval_result: Optional[Dict[str, Any]] = None
     performance: Optional[Dict[str, Any]] = None

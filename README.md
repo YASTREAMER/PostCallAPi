@@ -38,7 +38,7 @@ extraction job to that engine:
 ```text
 Company client
     |
-    | POST /extract
+    | POST /postcall/extract
     v
 FastAPI validates the request and returns a job_id
     |
@@ -48,12 +48,12 @@ vLLM continuously batches active requests on the GPU
     |
     | result is parsed, validated, and normalized
     v
-Client polls GET /status/{job_id}
+Client polls GET /postcall/status/{job_id}
 ```
 
 Important characteristics:
 
-- `POST /extract` is asynchronous. It returns a job ID instead of waiting for
+- `POST /postcall/extract` is asynchronous. It returns a job ID instead of waiting for
   inference to finish.
 - vLLM performs continuous dynamic batching. The API does not create fixed
   request batches and does not wait for a batch to fill.
@@ -205,15 +205,16 @@ The actual generation can end earlier when the model emits its end token.
 | Variable | Default | Meaning |
 |---|---:|---|
 | `POSTCALL_API_HOST` | `0.0.0.0` | Bind address used by `python src/main.py`. |
-| `POSTCALL_API_PORT` | `8000` | Port used by `python src/main.py`. |
+| `POSTCALL_API_PORT` | `8088` | Port used by `python src/main.py`. |
+| `POSTCALL_API_PREFIX` | `/postcall` | URL prefix applied to every API route. |
 | `POSTCALL_MAX_ACTIVE_JOBS` | `100` | Maximum total `pending` plus `processing` jobs accepted by this process. |
 | `POSTCALL_JOB_TTL_SECONDS` | `3600` | Time a completed job remains eligible for retrieval. |
 | `POSTCALL_MAX_COMPLETED_JOBS` | `10000` | Maximum completed job records retained in process memory. |
 
-When the active-job limit is reached, `POST /extract` returns HTTP `429` with a
+When the active-job limit is reached, `POST /postcall/extract` returns HTTP `429` with a
 `Retry-After: 5` header.
 
-`POSTCALL_API_HOST` and `POSTCALL_API_PORT` apply when starting
+`POSTCALL_API_HOST`, `POSTCALL_API_PORT`, and `POSTCALL_API_PREFIX` apply when starting
 `src/main.py`. When using the Uvicorn CLI, the CLI `--host` and `--port`
 arguments control the listener.
 
@@ -249,7 +250,7 @@ From the project root:
 poetry run uvicorn main:app \
   --app-dir src \
   --host 127.0.0.1 \
-  --port 8000
+  --port 8088
 ```
 
 ### Listen on the private server interface
@@ -261,14 +262,15 @@ VPN, firewall, or internal load balancer:
 poetry run uvicorn main:app \
   --app-dir src \
   --host 0.0.0.0 \
-  --port 8000
+  --port 8088
 ```
 
 Alternatively:
 
 ```bash
 POSTCALL_API_HOST=0.0.0.0 \
-POSTCALL_API_PORT=8000 \
+POSTCALL_API_PORT=8088 \
+POSTCALL_API_PREFIX=/postcall \
 poetry run python src/main.py
 ```
 
@@ -285,17 +287,17 @@ until startup has completed.
 Check health:
 
 ```bash
-curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8088/postcall/health
 ```
 
-FastAPI also exposes interactive documentation at `/docs` and the OpenAPI
-schema at `/openapi.json`. Keep these endpoints on the private network.
+FastAPI also exposes interactive documentation at `/postcall/docs` and the OpenAPI
+schema at `/postcall/openapi.json`. Keep these endpoints on the private network.
 
 ## Private production deployment
 
 This API currently has no built-in authentication. Because only the company
 should access it, deploy it on a private subnet or behind a company-controlled
-gateway. Do not expose port 8000 directly to the public Internet.
+gateway. Do not expose port 8088 directly to the public Internet.
 
 Recommended topology:
 
@@ -350,7 +352,7 @@ Group=postcall
 WorkingDirectory=/opt/PostCallAPi
 EnvironmentFile=/etc/postcall-api.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/local/bin/poetry run uvicorn main:app --app-dir src --host 0.0.0.0 --port 8000
+ExecStart=/usr/local/bin/poetry run uvicorn main:app --app-dir src --host 0.0.0.0 --port 8088
 Restart=on-failure
 RestartSec=5
 TimeoutStartSec=0
@@ -400,7 +402,7 @@ example:
 
 ```ini
 Environment=CUDA_VISIBLE_DEVICES=0
-ExecStart=/usr/local/bin/poetry run uvicorn main:app --app-dir src --host 0.0.0.0 --port 8000
+ExecStart=/usr/local/bin/poetry run uvicorn main:app --app-dir src --host 0.0.0.0 --port 8088
 ```
 
 The next instance can use physical GPU `1` and another private port. Because
@@ -416,19 +418,19 @@ and deployments.
 The base URL in the examples is:
 
 ```text
-http://127.0.0.1:8000
+http://127.0.0.1:8088/postcall
 ```
 
 Replace it with the internal company endpoint when calling the deployed API.
 
-### `GET /health`
+### `GET /postcall/health`
 
 Returns service and in-memory job counts.
 
 Example:
 
 ```bash
-curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8088/postcall/health
 ```
 
 Response:
@@ -448,14 +450,14 @@ Response:
 The health response confirms that the application is running. It does not
 perform a new model generation.
 
-### `POST /extract`
+### `POST /postcall/extract`
 
 Accepts an extraction request, creates a background job, and returns its ID.
 
 Example:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/extract \
+curl -X POST http://127.0.0.1:8088/postcall/extract \
   -H 'Content-Type: application/json' \
   -d '{
     "postcall_data": [
@@ -518,7 +520,6 @@ The current endpoint returns HTTP `200` when the job is accepted.
 | `functions_called` | No | Functions or tools called during the conversation. Defaults to an empty list. |
 | `call_metadata` | No | Additional JSON context. Defaults to an empty object. |
 | `timezone` | No | Context timezone. Defaults to `Asia/Kolkata`. |
-| `ground_truth` | No | Evaluation-only expected output. Omit in normal production traffic. |
 
 Each `postcall_data` item supports:
 
@@ -548,14 +549,14 @@ Every result field has this shape:
 }
 ```
 
-### `GET /status/{job_id}`
+### `GET /postcall/status/{job_id}`
 
 Returns the current state and, when available, the result.
 
 Example:
 
 ```bash
-curl http://127.0.0.1:8000/status/dc37a7a1-d24b-41b8-b0f9-82a0ad6eb25f
+curl http://127.0.0.1:8088/postcall/status/dc37a7a1-d24b-41b8-b0f9-82a0ad6eb25f
 ```
 
 Possible statuses:
@@ -583,7 +584,6 @@ Completed response:
     }
   },
   "error": null,
-  "eval_result": null,
   "performance": {
     "attempts": 1,
     "retried": false,
@@ -612,25 +612,27 @@ Error response:
   "status": "error",
   "result": null,
   "error": "Error description",
-  "eval_result": null,
   "performance": null
 }
 ```
 
 An unknown or expired job ID returns HTTP `404`.
 
-### Evaluation-only `ground_truth`
+### Production smoke test
 
-When `ground_truth` is supplied, the server evaluates the completed result and
-returns `eval_result`. It also appends evaluation output to:
+After the API reports that the model is loaded, submit the included
+production-format example and wait for the complete normalized result:
 
-```text
-src/eval_log/eval_logs.jsonl
+```bash
+poetry run python3 src/api_smoke_test.py \
+  --payload examples/production_request.json \
+  --api-url http://127.0.0.1:8088/postcall
 ```
 
-This feature is intended for controlled evaluation, not normal production
-requests. The live benchmark evaluates ground truth on the benchmark client and
-does not need to send it to the API.
+The command prints the full status response, including every field's `value`
+and `comment`, and saves the same response with timing metadata under `output/`.
+It does not send ground truth, calculate accuracy, flatten fields, or modify the
+model result.
 
 ## Batching, concurrency, and capacity
 
@@ -690,7 +692,7 @@ Start with one small request before running a concurrent benchmark.
 Submit:
 
 ```bash
-RESPONSE=$(curl -sS -X POST http://127.0.0.1:8000/extract \
+RESPONSE=$(curl -sS -X POST http://127.0.0.1:8088/postcall/extract \
   -H 'Content-Type: application/json' \
   -d '{
     "postcall_data": [
@@ -710,7 +712,7 @@ echo "$RESPONSE"
 Copy the returned `job_id`, then poll:
 
 ```bash
-curl http://127.0.0.1:8000/status/JOB_ID
+curl http://127.0.0.1:8088/postcall/status/JOB_ID
 ```
 
 Confirm that the job reaches `done`, the result contains every requested field,
@@ -750,7 +752,7 @@ poetry run python src/api_csv_test.py \
   --csv data/Data_with_outcome_fields.csv \
   --count 200 \
   --concurrency 10 \
-  --api-url http://127.0.0.1:8000
+  --api-url http://127.0.0.1:8088/postcall
 ```
 
 Benchmark a private remote server:
@@ -792,6 +794,28 @@ poetry run python src/api_csv_test.py --count 1000 --concurrency 50
 Keep `--concurrency` at or below `POSTCALL_MAX_ACTIVE_JOBS`, leaving capacity
 for health checks and other clients.
 
+### Production stress test without evaluation
+
+Use `--no-evaluation` to generate concurrent production-shaped traffic without
+loading or scoring CSV ground truth:
+
+```bash
+poetry run python3 src/api_csv_test.py \
+  --csv data/Data_with_outcome_fields.csv \
+  --count 1000 \
+  --concurrency 20 \
+  --selection random \
+  --seed 42 \
+  --api-url http://127.0.0.1:8088/postcall \
+  --no-evaluation
+```
+
+Increase concurrency in separate runs (`20`, `30`, `40`, then `50`) while
+keeping the selected rows and seed unchanged. Stress-mode output is written to
+`output/api_stress_<timestamp>/`. `responses.jsonl` is sorted by selected
+request position and preserves every normalized result field, value, comment,
+and performance object returned by the API.
+
 ### Benchmark options
 
 | Option | Default | Description |
@@ -801,11 +825,12 @@ for health checks and other clients.
 | `--concurrency` | `10` | Maximum number of in-flight API jobs. |
 | `--selection` | `random` | `random` for seeded sampling or `first` for the first N rows. |
 | `--seed` | `42` | Seed used for reproducible random sampling. |
-| `--api-url` | `http://127.0.0.1:8000` | API base URL. |
+| `--api-url` | `http://127.0.0.1:8088/postcall` | API base URL. |
 | `--output-root` | `output` | Parent directory for reports. |
 | `--poll-interval` | `1.0` | Seconds between status polls. |
 | `--job-timeout` | `1200.0` | Maximum seconds to wait for a job. |
 | `--request-timeout` | `60.0` | HTTP timeout per submit or poll request. |
+| `--no-evaluation` | disabled | Skip local scoring and run as a production stress client. |
 
 Display the command help:
 
@@ -822,6 +847,7 @@ output/api_test_<timestamp>/
 ├── summary.json
 ├── rows.csv
 ├── field_scores.csv
+├── responses.jsonl
 └── results.jsonl
 ```
 
@@ -832,6 +858,8 @@ output/api_test_<timestamp>/
   and accuracy.
 - `field_scores.csv`: per-field predictions, ground truth, schema type, type
   validity, match status, and score.
+- `responses.jsonl`: complete nested API results and comments, sorted by
+  selected request position.
 - `results.jsonl`: complete request/result/evaluation details for debugging.
 
 During execution, the benchmark prints:
@@ -1028,7 +1056,7 @@ preemption, and tail latency.
 Monitor:
 
 ```bash
-curl -fsS http://127.0.0.1:8000/health
+curl -fsS http://127.0.0.1:8088/postcall/health
 ```
 
 Alert when:
@@ -1096,7 +1124,7 @@ Before production use:
 - configure per-client rate and concurrency limits;
 - configure maximum HTTP body and header sizes;
 - keep `POSTCALL_MAX_ACTIVE_JOBS` bounded;
-- omit `ground_truth` from normal production requests;
+- keep evaluation labels and scoring outside the production API;
 - protect model, adapter, log, CSV, and benchmark files with service-account
   permissions;
 - avoid logging complete transcripts unless explicitly required;
