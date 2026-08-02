@@ -18,7 +18,7 @@ import json
 import logging
 import re
 import time
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 from vllm.lora.request import LoRARequest
 from vllm import SamplingParams
@@ -108,15 +108,9 @@ def _extract_json(text: str) -> Dict[str, Any]:
     return json.loads(cleaned[start : end + 1])
 
 
-def _build_prompt_text(prompt: str) -> str:
-    from prompt_builder import SYSTEM_INSTRUCTION
-
-    messages = [
-        {"role": "system", "content": SYSTEM_INSTRUCTION},
-        {"role": "user", "content": prompt},
-    ]
+def _build_prompt_text(messages: Sequence[Mapping[str, str]]) -> str:
     return _tokenizer.apply_chat_template(
-        messages,
+        list(messages),
         tokenize=False,
         add_generation_prompt=True,
         enable_thinking=ENABLE_THINKING,
@@ -124,11 +118,11 @@ def _build_prompt_text(prompt: str) -> str:
 
 
 async def _run_generation(
-    prompt: str,
+    messages: Sequence[Mapping[str, str]],
     request_id: str,
     requested_max_tokens: int,
 ) -> Tuple[str, Dict[str, Any]]:
-    text = _build_prompt_text(prompt)
+    text = _build_prompt_text(messages)
     prompt_token_ids = _tokenizer.encode(text)
     available_tokens = max(1, MAX_MODEL_LEN - len(prompt_token_ids) - 32)
     generation_limit = min(requested_max_tokens, available_tokens)
@@ -197,7 +191,9 @@ def _validate_commented_result(
         raise ValueError("; ".join(errors))
 
 
-def _corrective_prompt(prompt: str, expected_fields: Sequence[str]) -> str:
+def _corrective_messages(
+    messages: Sequence[Mapping[str, str]], expected_fields: Sequence[str]
+) -> list[dict[str, str]]:
     shape = {
         name: {
             "value": f"<actual value for {name}>",
@@ -205,18 +201,20 @@ def _corrective_prompt(prompt: str, expected_fields: Sequence[str]) -> str:
         }
         for name in expected_fields
     }
-    return (
-        f"{prompt}\n\n"
+    correction = (
         "IMPORTANT CORRECTION: Your previous response had the wrong JSON "
         "shape. Generate a fresh answer. Put each requested field at the top "
         "level, and give every field its own non-empty value and evidence "
         "comment. Do not put value/comment directly at the top level. Use "
         f"exactly this structure: {json.dumps(shape, ensure_ascii=False)}"
     )
+    return [dict(message) for message in messages] + [
+        {"role": "user", "content": correction}
+    ]
 
 
 async def generate_extraction(
-    prompt: str,
+    messages: Sequence[Mapping[str, str]],
     request_id: str,
     max_retries: int = 1,
     expected_fields: Optional[Sequence[str]] = None,
@@ -235,13 +233,13 @@ async def generate_extraction(
     )
 
     for attempt in range(max_retries + 1):
-        generation_prompt = (
-            prompt
+        generation_messages = (
+            messages
             if attempt == 0 or expected_fields is None
-            else _corrective_prompt(prompt, expected_fields)
+            else _corrective_messages(messages, expected_fields)
         )
         raw, usage = await _run_generation(
-            generation_prompt,
+            generation_messages,
             f"{request_id}-attempt{attempt}",
             requested_max_tokens,
         )

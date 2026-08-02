@@ -1,52 +1,52 @@
-# Postcall Extraction API Integration Guide
+# Postcall Extraction API — Caller-Supplied Prompt Guide
 
-## Connection details
+## Overview
 
-The Postcall Extraction API is publicly reachable over the internet.
+The backend server now builds the complete LLM conversation. The Postcall API
+does not build a prompt from a transcript, metadata, or function calls.
 
-```text
-Base URL: http://101.53.137.25:8088/postcall
+The backend sends:
+
+1. `messages`: the ordered chat messages given to the model;
+2. `postcall_data`: the expected output fields and their types/defaults; and
+3. optional `include_performance`: whether diagnostic timing/token data should
+   be returned.
+
+The API applies the local model chat template, runs vLLM with the Postcall LoRA
+adapter, validates the generated JSON, normalizes field values, and returns the
+completed result in the same HTTP response. There are no job IDs and no status
+polling.
+
+## Connection and authentication
+
+```bash
+POSTCALL_API_URL=http://101.53.137.25:8808/postcall
+POSTCALL_API_KEY=replace-with-the-key-provided-by-the-api-owner
 ```
 
-No SSH tunnel is required. The API currently uses plain HTTP and does not
-require an API key or other authentication.
+The API root, health, and extraction endpoints require:
 
-## Available endpoints
+```text
+Authorization: Bearer <POSTCALL_API_KEY>
+```
 
-| Method | Endpoint | Purpose |
+The current public URL uses plain HTTP. HTTP does not encrypt API keys or call
+content. Use HTTPS or a trusted private network before sending sensitive data.
+
+## Endpoints
+
+| Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/health` | Check whether the API is available. |
-| `POST` | `/extract` | Submit a call transcript for asynchronous extraction. |
-| `GET` | `/status/{job_id}` | Check a job and retrieve its completed result. |
-| `GET` | `/docs` | Open the interactive FastAPI documentation. |
+| `GET` | `/health` | Check availability and active request count. |
+| `POST` | `/extract` | Send messages and wait for the complete LLM extraction. |
+| `GET` | `/docs` | OpenAPI/Swagger documentation (currently public). |
 
-The complete URLs are formed by appending an endpoint to the base URL. For
-example:
-
-```text
-http://101.53.137.25:8088/postcall/health
-```
-
-## Processing workflow
-
-Extraction is asynchronous. Integrators must use the following workflow:
-
-1. Optionally call `GET /health` to confirm that the service is available.
-2. Send the extraction payload to `POST /extract`.
-3. Read the `job_id` from the accepted response.
-4. Poll `GET /status/{job_id}` while the status is `pending` or `processing`.
-5. Stop polling when the status becomes `done` or `error`.
-6. When the status is `done`, read the extracted fields from `result`.
-
-Do not expect `POST /extract` to return the completed LLM result immediately.
-
-## Check service health
-
-Request:
+## Health check
 
 ```bash
 curl --fail-with-body --max-time 10 \
-  http://101.53.137.25:8088/postcall/health
+  -H "Authorization: Bearer $POSTCALL_API_KEY" \
+  "$POSTCALL_API_URL/health"
 ```
 
 Example response:
@@ -54,241 +54,338 @@ Example response:
 ```json
 {
   "status": "ok",
-  "jobs": {
-    "processing": 2,
-    "done": 15
-  },
-  "retained_jobs": 17,
-  "max_active_jobs": 60
+  "active_requests": 0,
+  "max_active_requests": 60
 }
 ```
 
-The health endpoint confirms that the web application is running. It does not
-perform an LLM generation.
-
-## Submit an extraction
-
-Request:
+## Extraction request
 
 ```bash
-curl --fail-with-body --max-time 60 \
-  -X POST \
-  http://101.53.137.25:8088/postcall/extract \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "postcall_data": [
-      {
-        "name": "customer_interested",
-        "description": "True when the customer clearly expresses interest in the offer.",
-        "type": "boolean",
-        "defaultValue": false
-      },
-      {
-        "name": "disposition_reason",
-        "description": "Briefly describe the final outcome of the call.",
-        "type": "text",
-        "defaultValue": ""
-      },
-      {
-        "name": "follow_up_required",
-        "description": "True when the customer or agent requests another contact.",
-        "type": "boolean",
-        "defaultValue": false
-      }
-    ],
-    "transcription": "Agent: Would you like a product demonstration tomorrow? Customer: Yes, please schedule it for 3 PM.",
-    "call_duration": 42.5,
-    "hangup_reason": "customer-ended-call",
-    "functions_called": [],
-    "call_metadata": {
-      "call_id": "call-123",
-      "source": "backend"
-    },
-    "timezone": "Asia/Kolkata"
-  }'
-```
-
-Accepted response:
-
-```json
+curl --fail-with-body --max-time 1200 \
+  -X POST "$POSTCALL_API_URL/extract" \
+  -H "Authorization: Bearer $POSTCALL_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d @- <<JSON
 {
-  "job_id": "dc37a7a1-d24b-41b8-b0f9-82a0ad6eb25f",
-  "status": "pending"
-}
-```
-
-The accepted response means that the job was queued. It does not mean that LLM
-processing has finished.
-
-## Extraction request schema
-
-### Top-level fields
-
-| Field | Type | Required | Description |
-|---|---|---:|---|
-| `postcall_data` | array | Yes | Fields that the LLM must extract. |
-| `transcription` | string | Yes | Complete call transcript. |
-| `call_duration` | number or `null` | No | Call duration, normally in seconds. |
-| `hangup_reason` | string | No | Reason that the call ended. Defaults to an empty string. |
-| `functions_called` | array | No | Tools or functions called during the conversation. Defaults to `[]`. |
-| `call_metadata` | object | No | Caller-provided metadata such as call ID or campaign. Defaults to `{}`. |
-| `timezone` | string | No | Timezone used to interpret the call. Defaults to `Asia/Kolkata`. |
-
-### `postcall_data` fields
-
-Each item describes one value that should appear in the LLM result.
-
-| Field | Type | Required | Description |
-|---|---|---:|---|
-| `name` | string | Yes | Unique output field name. |
-| `description` | string | Yes | Clear instructions defining what the model should extract. |
-| `type` | string | No | Output type. Defaults to `text`. |
-| `defaultValue` | any | No | Fallback value when the transcript does not provide an answer. |
-| `defaultValueConfig` | object | No | Optional metadata associated with the default value. |
-
-Supported output types include:
-
-- `boolean`
-- `number`
-- `text`
-- `string`
-- `selector`
-- `categorical`
-
-Aliases are also accepted: `bool` becomes `boolean`, `integer` and `float`
-become `number`, and `str` becomes `string`.
-
-Descriptions should be explicit about the evidence required for a positive or
-non-default result. Use a `defaultValue` with the same JSON type requested by
-`type`.
-
-### `functions_called` fields
-
-Each function record can contain:
-
-| Field | Type | Required |
-|---|---|---:|
-| `name` | string | Yes |
-| `parameters` | object or `null` | No |
-| `response` | any | No |
-| `success` | boolean | No; defaults to `false` |
-| `timestamp` | string or `null` | No |
-
-## Poll a submitted job
-
-Replace the example UUID with the `job_id` returned by `POST /extract`.
-
-```bash
-curl --fail-with-body --max-time 60 \
-  http://101.53.137.25:8088/postcall/status/dc37a7a1-d24b-41b8-b0f9-82a0ad6eb25f
-```
-
-Possible job statuses:
-
-| Status | Meaning | Client action |
-|---|---|---|
-| `pending` | The job was accepted but has not started. | Wait and poll again. |
-| `processing` | The job is running or waiting in the model scheduler. | Wait and poll again. |
-| `done` | Extraction completed successfully. | Read `result`. |
-| `error` | Extraction failed. | Stop polling and record `error`. |
-
-Poll approximately every 1–2 seconds. Avoid continuous polling without a
-delay. Use an overall job deadline appropriate for LLM processing, such as
-10–20 minutes, rather than an unlimited polling loop.
-
-### Completed response
-
-```json
-{
-  "job_id": "dc37a7a1-d24b-41b8-b0f9-82a0ad6eb25f",
-  "status": "done",
-  "result": {
-    "customer_interested": {
-      "value": true,
-      "comment": "The customer agreed to schedule a demonstration."
+  "messages": [
+    {
+      "role": "system",
+      "content": "You are a call-analysis extraction engine. Return only one JSON object. Each requested field must contain exactly value and comment. Do not rename fields and do not return markdown."
     },
-    "disposition_reason": {
-      "value": "Customer requested a product demonstration.",
-      "comment": "The customer asked for the demonstration at 3 PM."
-    },
-    "follow_up_required": {
-      "value": true,
-      "comment": "A demonstration must be scheduled."
+    {
+      "role": "user",
+      "content": "<variables_to_extract>\n[{\"name\":\"intrested\",\"type\":\"boolean\",\"description\":\"True if the user showed genuine interest.\"},{\"name\":\"callback_time\",\"type\":\"text\",\"description\":\"Requested callback time, otherwise an empty string.\"}]\n</variables_to_extract>\n<current_time>2026-08-01T12:00:00+05:30</current_time>\n<transcription>Agent: Would you like to know more? User: This sounds interesting. Call me tomorrow at 11 AM.</transcription>\n<functions_called>[]</functions_called>\n<call_metadata>{\"customer_name\":\"Rohan Sharma\"}</call_metadata>"
     }
-  },
-  "error": null,
-  "performance": {
-    "attempts": 1,
-    "retried": false
+  ],
+  "postcall_data": [
+    {
+      "name": "intrested",
+      "type": "boolean",
+      "description": "True if the user showed genuine interest.",
+      "defaultValue": false
+    },
+    {
+      "name": "callback_time",
+      "type": "text",
+      "description": "Requested callback time, otherwise an empty string.",
+      "defaultValue": ""
+    }
+  ],
+  "include_performance": false
+}
+JSON
+```
+
+The HTTP connection remains open while inference runs. A successful request
+returns HTTP `200` with the completed result.
+
+## Request schema
+
+### `messages`
+
+`messages` is required and must contain at least one item.
+
+| Field | Required | Values | Description |
+|---|---:|---|---|
+| `role` | Yes | `system`, `user`, or `assistant` | Chat role passed to the model. |
+| `content` | Yes | Non-empty string | Exact caller-provided prompt content. |
+
+The usual production shape is:
+
+```json
+{
+  "messages": [
+    { "role": "system", "content": "task and output instructions" },
+    { "role": "user", "content": "transcript and call context" }
+  ]
+}
+```
+
+Message order is preserved. The API does not prepend its own system prompt and
+does not rewrite the supplied content.
+
+### `postcall_data`
+
+`postcall_data` is required even when the field definitions are already present
+inside the prompt. The API uses it outside the LLM for deterministic output
+validation and normalization.
+
+| Field | Required | Description |
+|---|---:|---|
+| `name` | Yes | Exact top-level result key. |
+| `description` | Yes | Field meaning; also useful when embedding the same object in the prompt. |
+| `type` | No | Expected value type; defaults to `text`. |
+| `defaultValue` | No | Fallback used when the model omits an appropriate value. |
+| `defaultValueConfig` | No | Accepted compatibility metadata. |
+
+Supported normalized types are `boolean`, `number`, `text`, `string`,
+`selector`, and `categorical`. Aliases include `bool`, `integer`, `float`, and
+`str`.
+
+The spelling and capitalization of every `name` must match the keys requested
+inside the prompt. For example, the supplied JavaScript intentionally uses
+`intrested`; the API preserves that spelling rather than correcting it.
+
+### Optional field
+
+| Field | Default | Description |
+|---|---:|---|
+| `include_performance` | `false` | Include model timing and token diagnostics. |
+
+Unknown top-level request fields are rejected with HTTP `422`. Do not send the
+old top-level fields such as `transcription`, `call_duration`, `hangup_reason`,
+`functions_called`, `call_metadata`, or `timezone`. Put that information inside
+a caller-built message instead.
+
+## Successful response
+
+```json
+{
+  "result": {
+    "intrested": {
+      "value": true,
+      "comment": "User explicitly said the product sounds interesting."
+    },
+    "callback_time": {
+      "value": "2026-08-02T11:00:00",
+      "comment": "User requested a callback tomorrow at 11 AM."
+    }
   }
 }
 ```
 
-Every requested output field is returned as an object containing:
+Every expected field is returned as:
 
 ```json
 {
-  "value": "the normalized extracted value",
-  "comment": "supporting explanation or evidence"
+  "value": "normalized value",
+  "comment": "supporting evidence"
 }
 ```
 
-The exact keys inside `performance` may vary. Backend integrations should not
-depend on every performance field being present.
+The API checks that:
 
-### Error response
+- every `postcall_data[].name` exists at the top level;
+- no unexpected top-level result keys are present;
+- each field contains exactly `value` and `comment`; and
+- each comment is a non-empty string.
+
+If the first model response has the wrong shape, the API retries with an
+additional corrective user message. It then normalizes values using
+`postcall_data`.
+
+With `include_performance: true`, the response can additionally contain:
 
 ```json
 {
-  "job_id": "dc37a7a1-d24b-41b8-b0f9-82a0ad6eb25f",
-  "status": "error",
-  "result": null,
-  "error": "Error description",
-  "performance": null
+  "result": {},
+  "performance": {
+    "attempts": 1,
+    "retried": false,
+    "generation_seconds": 2.417,
+    "prompt_tokens": 486,
+    "completion_tokens": 61,
+    "attempt_details": []
+  }
 }
 ```
 
-## HTTP errors and retry behavior
+## Node.js 18+ integration
 
-| HTTP status | Meaning | Recommended action |
+The backend can reuse the existing `prompt`, `userContent`, and `postcall_data`
+variables from the Azure implementation. Node.js 18 and newer provide `fetch`
+and `AbortSignal.timeout` globally.
+
+Set these variables on the Node server:
+
+```env
+POSTCALL_API_URL=http://101.53.137.25:8808/postcall
+POSTCALL_API_KEY=replace-with-the-key-provided-by-the-api-owner
+```
+
+Use this request helper:
+
+```javascript
+require("dotenv").config();
+
+const POSTCALL_API_URL = (
+  process.env.POSTCALL_API_URL ||
+  "http://101.53.137.25:8808/postcall"
+).replace(/\/$/, "");
+
+const POSTCALL_API_KEY = process.env.POSTCALL_API_KEY;
+
+async function callPostcallAPI({
+  prompt,
+  userContent,
+  postcallData,
+  includePerformance = false,
+}) {
+  if (!POSTCALL_API_KEY) {
+    throw new Error("POSTCALL_API_KEY is not configured");
+  }
+
+  const response = await fetch(`${POSTCALL_API_URL}/extract`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${POSTCALL_API_KEY}`,
+    },
+    body: JSON.stringify({
+      messages: [
+        { role: "system", content: prompt },
+        { role: "user", content: userContent },
+      ],
+      postcall_data: postcallData,
+      include_performance: includePerformance,
+    }),
+    signal: AbortSignal.timeout(20 * 60 * 1000),
+  });
+
+  const responseText = await response.text();
+  let responseBody;
+
+  try {
+    responseBody = JSON.parse(responseText);
+  } catch {
+    throw new Error(
+      `Postcall API returned invalid JSON (${response.status}): ${responseText}`
+    );
+  }
+
+  if (!response.ok) {
+    const error = new Error(
+      `Postcall API returned HTTP ${response.status}: ${JSON.stringify(responseBody)}`
+    );
+    error.status = response.status;
+    error.retryAfter = response.headers.get("retry-after");
+    error.response = responseBody;
+    throw error;
+  }
+
+  if (!responseBody.result || typeof responseBody.result !== "object") {
+    throw new Error(
+      `Postcall API response is missing result: ${JSON.stringify(responseBody)}`
+    );
+  }
+
+  return responseBody;
+}
+```
+
+Replace the Azure completion call with:
+
+```javascript
+try {
+  const response = await callPostcallAPI({
+    prompt,
+    userContent,
+    postcallData: postcall_data,
+    includePerformance: true,
+  });
+
+  const result = response.result;
+
+  result.x_model_used = {
+    value: "postcall-qwen3-14b-lora",
+    comment: "Model used for post-call analysis.",
+  };
+
+  console.log(
+    "Post-call analysis result:\n",
+    JSON.stringify(result, null, 2)
+  );
+
+  if (response.performance) {
+    console.log("Performance:", response.performance);
+  }
+} catch (error) {
+  console.error("Postcall API request failed:", {
+    message: error.message,
+    status: error.status,
+    retryAfter: error.retryAfter,
+    response: error.response,
+  });
+}
+```
+
+The request remains open until inference finishes. Do not poll a status route.
+On HTTP `429`, wait for the `retryAfter` duration and retry with bounded backoff.
+Do not retry HTTP `401` or `422` without correcting the credentials or payload.
+
+## Error handling
+
+| HTTP status | Meaning | Client action |
 |---:|---|---|
-| `200` | Request succeeded or extraction job was accepted. | Process the JSON response. |
-| `404` | The job ID is unknown or has expired. | Stop polling and verify the job ID. |
-| `422` | The request payload does not match the required schema. | Correct the request; do not retry unchanged. |
-| `429` | The inference queue has reached its active-job limit. | Respect `Retry-After`, then retry submission. |
-| `500` | Unexpected server error. | Log the response and retry with bounded backoff if appropriate. |
+| `200` | Complete extraction returned. | Read `result`. |
+| `401` | Bearer key missing or invalid. | Fix the `Authorization` header. |
+| `422` | Request does not match the schema. | Correct the payload; do not retry unchanged. |
+| `429` | Active-request limit reached. | Respect `Retry-After` and retry with backoff. |
+| `500` | Model generation or output validation failed. | Log the response and retry with bounded backoff. |
 
-Clients should:
+Use a request timeout long enough for model generation, such as 10–20 minutes.
+Do not automatically retry a timed-out POST indefinitely; the original request
+may still have consumed inference work.
 
-- use a connection/request timeout;
-- retry temporary network failures and HTTP `429`/`5xx` responses with bounded
-  exponential backoff;
-- avoid retrying HTTP `422` without correcting the payload;
-- store the returned `job_id` so processing can resume after a client restart;
-- make sure duplicate submission is acceptable before retrying a submission
-  whose response was lost, because the API does not currently accept an
-  idempotency key;
-- limit client concurrency so the public inference queue is not overwhelmed.
+## How the supplied Azure JavaScript works
 
-Completed jobs are retained temporarily in server memory. Poll and save the
-result promptly rather than treating the API as permanent job storage.
+The supplied script performs these steps:
+
+1. Loads Azure credentials from environment variables with `dotenv`.
+2. Creates one `AzureOpenAI` client using the endpoint, API key, and API
+   version.
+3. Defines the Azure deployment name (`gpt-4.1-mini-1`) and temperature (`0.8`).
+4. Converts `postcall_data` field types into an Azure/OpenAI strict JSON Schema.
+   Each result field must be an object containing `value` and `comment`.
+5. Builds `prompt`, the system message containing task instructions, field
+   definitions, defaults, and output rules.
+6. Builds `userContent`, the user message containing previous dispositions,
+   duration, hangup reason, transcript, function calls, and metadata.
+7. Calls Azure Chat Completions with those two messages and the strict
+   `response_format` schema.
+8. Reads token usage, separates cached from billed input tokens, and estimates
+   cost using the configured per-token prices.
+9. Parses the assistant content as JSON and adds an `x_model_used` field only
+   in the JavaScript result after generation.
+
+For the H200 API, the backend should reuse the same `prompt` and `userContent`
+as the two entries in `messages`, and send the original `postcall_data`
+alongside them. The following Azure-only properties are not part of the H200
+request:
+
+- `model`: the H200 model and LoRA adapter are fixed by the service;
+- `temperature`: the service currently uses deterministic temperature `0.0`;
+- `response_format`: the service validates the generated JSON using
+  `postcall_data`; and
+- Azure endpoint, API version, token pricing, and Azure SDK credentials.
+
+The H200 API returns `result` directly rather than an Azure `choices` object.
+If the backend still needs `x_model_used`, it should add it after receiving the
+H200 response, just as the supplied JavaScript currently does.
 
 ## Interactive documentation
 
-FastAPI documentation is available at:
-
 ```text
-http://101.53.137.25:8088/postcall/docs
+http://101.53.137.25:8808/postcall/docs
 ```
-
-## Security notice
-
-This deployment is publicly reachable, has no authentication, and uses
-unencrypted HTTP. Anyone who knows or discovers the address can submit work,
-consume GPU capacity, and observe any data they send. Call transcripts may
-contain sensitive or personal information.
-
-For production use, the service owner should add HTTPS, authentication, request
-size limits, rate limiting, and network allowlisting where possible. Backend
-clients should not send secrets or regulated data over the current public HTTP
-endpoint.

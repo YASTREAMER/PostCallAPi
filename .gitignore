@@ -5,4 +5,5 @@ data/
 adapter/
 eval_csv/
 output/
+.env
 examples/

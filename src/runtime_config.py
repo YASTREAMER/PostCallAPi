@@ -27,9 +27,12 @@ ENABLE_PREFIX_CACHING = os.environ.get(
 API_HOST = os.environ.get("POSTCALL_API_HOST", "0.0.0.0")
 API_PORT = int(os.environ.get("POSTCALL_API_PORT", "8088"))
 API_PREFIX = os.environ.get("POSTCALL_API_PREFIX", "/postcall").strip()
-JOB_TTL_SECONDS = float(os.environ.get("POSTCALL_JOB_TTL_SECONDS", "3600"))
-MAX_COMPLETED_JOBS = int(os.environ.get("POSTCALL_MAX_COMPLETED_JOBS", "10000"))
-MAX_ACTIVE_JOBS = int(os.environ.get("POSTCALL_MAX_ACTIVE_JOBS", "100"))
+MAX_ACTIVE_REQUESTS = int(
+    os.environ.get(
+        "POSTCALL_MAX_ACTIVE_REQUESTS",
+        os.environ.get("POSTCALL_MAX_ACTIVE_JOBS", "100"),
+    )
+)
 
 if not 0 < GPU_MEMORY_UTILIZATION <= 1:
     raise ValueError(
@@ -51,8 +54,8 @@ if TOKENS_PER_FIELD <= 0:
     raise ValueError("VLLM_TOKENS_PER_FIELD must be greater than zero")
 if MAX_GENERATION_RETRIES < 0:
     raise ValueError("VLLM_MAX_GENERATION_RETRIES cannot be negative")
-if JOB_TTL_SECONDS <= 0 or MAX_COMPLETED_JOBS <= 0 or MAX_ACTIVE_JOBS <= 0:
-    raise ValueError("Job retention and capacity settings must be greater than zero")
+if MAX_ACTIVE_REQUESTS <= 0:
+    raise ValueError("POSTCALL_MAX_ACTIVE_REQUESTS must be greater than zero")
 
 
 def validate_runtime_paths() -> None:

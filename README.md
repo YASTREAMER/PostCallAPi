@@ -1,7 +1,7 @@
 # PostCall API
 
-PostCall API is an asynchronous post-call extraction service backed by vLLM,
-Qwen3, and a fine-tuned LoRA adapter. It accepts a call transcript plus a
+PostCall API is a post-call extraction service backed by vLLM,
+Qwen3, and a fine-tuned LoRA adapter. It accepts caller-built chat messages plus a
 caller-defined extraction schema and returns normalized, typed JSON values with
 short evidence comments.
 
@@ -32,35 +32,32 @@ benchmarking, offline evaluation, monitoring, and troubleshooting.
 
 ## How the service works
 
-The service uses one shared `AsyncLLMEngine` and submits every accepted
-extraction job to that engine:
+The service uses one shared `AsyncLLMEngine` and submits every concurrent
+extraction request to that engine:
 
 ```text
 Company client
     |
     | POST /postcall/extract
     v
-FastAPI validates the request and returns a job_id
+FastAPI validates the request and awaits AsyncLLMEngine.generate(...)
     |
-    | background task calls AsyncLLMEngine.generate(...)
-    v
 vLLM continuously batches active requests on the GPU
     |
-    | result is parsed, validated, and normalized
+    | complete result is parsed, validated, and normalized
     v
-Client polls GET /postcall/status/{job_id}
+The original POST returns the complete JSON response
 ```
 
 Important characteristics:
 
-- `POST /postcall/extract` is asynchronous. It returns a job ID instead of waiting for
-  inference to finish.
+- `POST /postcall/extract` keeps the HTTP request open until inference finishes
+  and returns the complete normalized output in that response.
 - vLLM performs continuous dynamic batching. The API does not create fixed
   request batches and does not wait for a batch to fill.
 - Multiple concurrent requests can be processed together by vLLM.
 - Each requested output field is normalized according to its configured type.
-- Jobs and results are stored in process memory. Restarting the API removes all
-  pending and completed job records.
+- The API does not create or retain job records for completed requests.
 - The service is intended to run as one Uvicorn worker per GPU. Multiple workers
   on the same GPU each load their own model and can exhaust GPU memory.
 
@@ -101,7 +98,7 @@ PostCallAPi/
 ├── data/                       # Evaluation CSV files; gitignored
 ├── output/                     # Live API benchmark reports; gitignored
 ├── src/
-│   ├── main.py                 # FastAPI application and in-memory job store
+│   ├── main.py                 # FastAPI application and direct-response route
 │   ├── model_service.py        # vLLM engine and generation logic
 │   ├── runtime_config.py       # Environment-based runtime configuration
 │   ├── schemas.py              # Request, response, and field schemas
@@ -200,18 +197,17 @@ min(
 
 The actual generation can end earlier when the model emits its end token.
 
-### API and job settings
+### API and request settings
 
 | Variable | Default | Meaning |
 |---|---:|---|
 | `POSTCALL_API_HOST` | `0.0.0.0` | Bind address used by `python src/main.py`. |
 | `POSTCALL_API_PORT` | `8088` | Port used by `python src/main.py`. |
 | `POSTCALL_API_PREFIX` | `/postcall` | URL prefix applied to every API route. |
-| `POSTCALL_MAX_ACTIVE_JOBS` | `100` | Maximum total `pending` plus `processing` jobs accepted by this process. |
-| `POSTCALL_JOB_TTL_SECONDS` | `3600` | Time a completed job remains eligible for retrieval. |
-| `POSTCALL_MAX_COMPLETED_JOBS` | `10000` | Maximum completed job records retained in process memory. |
+| `POSTCALL_API_KEY` | required | Single raw Bearer key loaded from the process environment or repository-root `.env`. |
+| `POSTCALL_MAX_ACTIVE_REQUESTS` | `100` | Maximum concurrent extraction requests accepted by this process. The former `POSTCALL_MAX_ACTIVE_JOBS` name remains a compatibility fallback. |
 
-When the active-job limit is reached, `POST /postcall/extract` returns HTTP `429` with a
+When the active-request limit is reached, `POST /postcall/extract` returns HTTP `429` with a
 `Retry-After: 5` header.
 
 `POSTCALL_API_HOST`, `POSTCALL_API_PORT`, and `POSTCALL_API_PREFIX` apply when starting
@@ -231,9 +227,7 @@ export VLLM_TOKENS_PER_FIELD=64
 export VLLM_MAX_GENERATION_RETRIES=1
 export VLLM_ENABLE_PREFIX_CACHING=true
 export POSTCALL_ENABLE_THINKING=false
-export POSTCALL_MAX_ACTIVE_JOBS=100
-export POSTCALL_JOB_TTL_SECONDS=3600
-export POSTCALL_MAX_COMPLETED_JOBS=10000
+export POSTCALL_MAX_ACTIVE_REQUESTS=100
 ```
 
 These are starting values, not universal optimal values. Measure throughput,
@@ -287,7 +281,8 @@ until startup has completed.
 Check health:
 
 ```bash
-curl http://127.0.0.1:8088/postcall/health
+curl -H "Authorization: Bearer $POSTCALL_API_KEY" \
+  http://127.0.0.1:8088/postcall/health
 ```
 
 FastAPI also exposes interactive documentation at `/postcall/docs` and the OpenAPI
@@ -372,9 +367,7 @@ VLLM_TOKENS_PER_FIELD=64
 VLLM_MAX_GENERATION_RETRIES=1
 VLLM_ENABLE_PREFIX_CACHING=true
 POSTCALL_ENABLE_THINKING=false
-POSTCALL_MAX_ACTIVE_JOBS=100
-POSTCALL_JOB_TTL_SECONDS=3600
-POSTCALL_MAX_COMPLETED_JOBS=10000
+POSTCALL_MAX_ACTIVE_REQUESTS=100
 ```
 
 After installing the service:
@@ -392,10 +385,9 @@ If the `poetry` binary is installed elsewhere, replace
 ### Multiple GPUs or replicas
 
 Run one API process per GPU and place an internal load balancer in front of
-them. The current job store is local process memory, so the status request for a
-job must return to the same replica that accepted it. Use sticky routing based
-on a suitable routing mechanism, or move the job store to shared infrastructure
-before deploying multiple replicas.
+them. Requests do not depend on a shared job store, so any replica can accept a
+new request. The load balancer must keep each connection on its selected
+replica until that response completes.
 
 Assign a single visible GPU and a different port to each service instance, for
 example:
@@ -409,9 +401,8 @@ The next instance can use physical GPU `1` and another private port. Because
 `CUDA_VISIBLE_DEVICES` remaps visible device numbering, each isolated process
 still sees its assigned GPU as device `0`.
 
-For strong production durability, use an external job store such as Redis or a
-database. The current implementation loses job state during process restarts
-and deployments.
+A process restart terminates its in-flight HTTP requests; clients should retry
+eligible failures with bounded exponential backoff.
 
 ## API reference
 
@@ -423,14 +414,66 @@ http://127.0.0.1:8088/postcall
 
 Replace it with the internal company endpoint when calling the deployed API.
 
+### Authentication
+
+Every `/postcall` endpoint requires the one API key in the standard Bearer
+header:
+
+```text
+Authorization: Bearer <POSTCALL_API_KEY>
+```
+
+The server loads `POSTCALL_API_KEY` from the process environment first and then
+from the repository-root `.env`. The real `.env` is intentionally ignored by
+Git. Keep `.env.example` as the non-secret template.
+
+For local curl commands, load the key without printing it:
+
+```bash
+set -a
+source .env
+set +a
+```
+
+Node should keep the same key in its environment and send it with the request.
+The `await fetch(...)` resolves when the complete model output is available:
+
+```javascript
+const response = await fetch(`${POSTCALL_API_URL}/extract`, {
+  method: "POST",
+  headers: {
+    "content-type": "application/json",
+    authorization: `Bearer ${process.env.POSTCALL_API_KEY}`,
+  },
+  body: JSON.stringify(payload),
+});
+
+if (!response.ok) {
+  throw new Error(`PostCall API returned ${response.status}`);
+}
+
+const extraction = await response.json();
+```
+
+Missing or incorrect keys receive HTTP `401` and:
+
+```text
+WWW-Authenticate: Bearer
+```
+
+The API compares the supplied raw key directly with its single configured key;
+it does not hash the key. Use HTTPS, an SSH tunnel, or another encrypted private
+transport so the header and transcripts are not exposed in transit.
+
 ### `GET /postcall/health`
 
-Returns service and in-memory job counts.
+Returns service health and the current active-request count.
 
 Example:
 
 ```bash
-curl http://127.0.0.1:8088/postcall/health
+curl -H "Authorization: Bearer $POSTCALL_API_KEY" \
+  http://127.0.0.1:8088/postcall/health
 ```
 
 Response:
@@ -438,12 +481,8 @@ Response:
 ```json
 {
   "status": "ok",
-  "jobs": {
-    "processing": 3,
-    "done": 27
-  },
-  "retained_jobs": 30,
-  "max_active_jobs": 100
+  "active_requests": 3,
+  "max_active_requests": 100
 }
 ```
 
@@ -452,171 +491,84 @@ perform a new model generation.
 
 ### `POST /postcall/extract`
 
-Accepts an extraction request, creates a background job, and returns its ID.
+Accepts caller-built chat messages, waits for generation, and returns the
+complete normalized result in the same HTTP response. The API no longer builds
+a prompt from top-level transcript or call-context fields.
 
-Example:
+Example request body:
+
+```json
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "Extract the requested call fields. Return only JSON. Every field must contain value and comment."
+    },
+    {
+      "role": "user",
+      "content": "<transcription>Customer: This sounds interesting. Please call tomorrow.</transcription>"
+    }
+  ],
+  "postcall_data": [
+    {
+      "name": "customer_interested",
+      "description": "True when the customer clearly expresses interest.",
+      "type": "boolean",
+      "defaultValue": false
+    }
+  ],
+  "include_performance": false
+}
+```
+
+Send it with:
 
 ```bash
 curl -X POST http://127.0.0.1:8088/postcall/extract \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "postcall_data": [
-      {
-        "name": "customer_interested",
-        "description": "True when the customer clearly expresses interest in the offer.",
-        "type": "boolean",
-        "defaultValue": false
-      },
-      {
-        "name": "disposition_reason",
-        "description": "Briefly state the final call outcome.",
-        "type": "text",
-        "defaultValue": ""
-      }
-    ],
-    "transcription": "Agent: Would you like a demo tomorrow? Customer: Yes, please schedule it for 3 PM.",
-    "call_duration": 42.5,
-    "hangup_reason": "customer-ended-call",
-    "functions_called": [
-      {
-        "name": "schedule_demo",
-        "parameters": {
-          "time": "15:00"
-        },
-        "response": {
-          "scheduled": true
-        },
-        "success": true,
-        "timestamp": "2026-07-30T10:00:00Z"
-      }
-    ],
-    "call_metadata": {
-      "call_id": "company-call-123",
-      "campaign": "demo-campaign"
-    },
-    "timezone": "Asia/Kolkata"
-  }'
+  -H "Authorization: Bearer $POSTCALL_API_KEY" \
+  -H "Content-Type: application/json" \
+  --data-binary @request.json
 ```
-
-Accepted response:
-
-```json
-{
-  "job_id": "dc37a7a1-d24b-41b8-b0f9-82a0ad6eb25f",
-  "status": "pending"
-}
-```
-
-The current endpoint returns HTTP `200` when the job is accepted.
-
-#### Request fields
-
-| Field | Required | Description |
-|---|---|---|
-| `postcall_data` | Yes | List of fields the model must extract. |
-| `transcription` | Yes | Call transcript supplied to the model. |
-| `call_duration` | No | Call duration as a number. |
-| `hangup_reason` | No | Call termination reason. Defaults to an empty string. |
-| `functions_called` | No | Functions or tools called during the conversation. Defaults to an empty list. |
-| `call_metadata` | No | Additional JSON context. Defaults to an empty object. |
-| `timezone` | No | Context timezone. Defaults to `Asia/Kolkata`. |
-
-Each `postcall_data` item supports:
-
-| Field | Required | Description |
-|---|---|---|
-| `name` | Yes | Output key. Leading and trailing whitespace is removed. |
-| `description` | Yes | Extraction instructions for the field. |
-| `type` | No | Expected output type. Defaults to `text`. |
-| `defaultValue` | No | Value used when an appropriate model value is unavailable. |
-| `defaultValueConfig` | No | Optional metadata accepted by the request schema. |
-
-Supported normalized type behavior:
-
-- `boolean`: output is normalized to JSON `true` or `false`.
-- `number`: output is normalized to an integer or floating-point number.
-- `text`, `string`, `selector`, and `categorical`: output is normalized to a
-  JSON string.
-- Aliases: `bool` becomes `boolean`; `integer` and `float` become `number`;
-  `str` becomes `string`.
-
-Every result field has this shape:
-
-```json
-{
-  "value": "typed value",
-  "comment": "short supporting evidence"
-}
-```
-
-### `GET /postcall/status/{job_id}`
-
-Returns the current state and, when available, the result.
-
-Example:
-
-```bash
-curl http://127.0.0.1:8088/postcall/status/dc37a7a1-d24b-41b8-b0f9-82a0ad6eb25f
-```
-
-Possible statuses:
-
-- `pending`: accepted but the background task has not started processing.
-- `processing`: submitted to the inference path; it may be running or waiting
-  in the vLLM scheduler.
-- `done`: extraction completed successfully.
-- `error`: generation, parsing, validation, or normalization failed.
 
 Completed response:
 
 ```json
 {
-  "job_id": "dc37a7a1-d24b-41b8-b0f9-82a0ad6eb25f",
-  "status": "done",
   "result": {
     "customer_interested": {
       "value": true,
-      "comment": "Customer agreed to schedule a demo."
-    },
-    "disposition_reason": {
-      "value": "Demo requested for 3 PM",
-      "comment": "Customer accepted the proposed demo."
+      "comment": "Customer said the offer sounds interesting."
     }
-  },
-  "error": null,
-  "performance": {
-    "attempts": 1,
-    "retried": false,
-    "generation_seconds": 2.417,
-    "prompt_tokens": 486,
-    "completion_tokens": 61,
-    "attempt_details": [
-      {
-        "generation_seconds": 2.417,
-        "prompt_tokens": 486,
-        "completion_tokens": 61,
-        "max_tokens": 1024,
-        "finish_reason": "stop",
-        "attempt": 1
-      }
-    ]
   }
 }
 ```
 
-Error response:
+The endpoint returns HTTP `200` only after generation finishes. There are no
+job IDs or status polling. Generation failures return HTTP `500`; an overloaded
+inference queue returns HTTP `429`.
 
-```json
-{
-  "job_id": "dc37a7a1-d24b-41b8-b0f9-82a0ad6eb25f",
-  "status": "error",
-  "result": null,
-  "error": "Error description",
-  "performance": null
-}
-```
+#### Request fields
 
-An unknown or expired job ID returns HTTP `404`.
+| Field | Required | Description |
+|---|---|---|
+| `messages` | Yes | Ordered chat messages supplied by the caller. |
+| `postcall_data` | Yes | Fields used to validate and normalize the generated JSON. |
+| `include_performance` | No | Include diagnostic timing/token metadata; defaults to `false`. |
+
+Each `messages` item contains a non-empty `content` string and a `role` of
+`system`, `user`, or `assistant`. The API preserves message order and does not
+prepend or build its own prompt.
+
+Each `postcall_data` item supports `name`, `description`, `type`,
+`defaultValue`, and `defaultValueConfig`. The field name must exactly match the
+output key requested in the caller-provided prompt.
+
+The old top-level fields (`transcription`, `call_duration`, `hangup_reason`,
+`functions_called`, `call_metadata`, and `timezone`) are no longer accepted.
+The caller should place that context in a message.
+
+See `POSTCALL_API_INTEGRATION.md` for the full contract, Azure-to-H200 mapping,
+and copy-ready request examples.
 
 ### Production smoke test
 
@@ -629,7 +581,7 @@ poetry run python3 src/api_smoke_test.py \
   --api-url http://127.0.0.1:8088/postcall
 ```
 
-The command prints the full status response, including every field's `value`
+The command prints the full API response, including every field's `value`
 and `comment`, and saves the same response with timing metadata under `output/`.
 It does not send ground truth, calculate accuracy, flatten fields, or modify the
 model result.
@@ -644,7 +596,7 @@ There is no fixed API batch size.
 
 For example, with 50 concurrent client requests:
 
-- the API creates up to 50 active generation jobs;
+- the API holds up to 50 active HTTP requests;
 - vLLM schedules those sequences according to available GPU compute, KV cache,
   prompt lengths, and generation lengths;
 - new requests can join later scheduler iterations;
@@ -660,7 +612,7 @@ Do not confuse these settings:
 | Control | What it controls |
 |---|---|
 | Benchmark `--concurrency` | How many requests the benchmark client keeps in flight. |
-| `POSTCALL_MAX_ACTIVE_JOBS` | How many pending plus processing jobs this API process accepts. |
+| `POSTCALL_MAX_ACTIVE_REQUESTS` | How many concurrent extraction requests this API process accepts. |
 | vLLM scheduler | How many sequences/tokens are actually processed during each GPU iteration. |
 
 The current engine configuration does not set `max_num_seqs` or
@@ -675,7 +627,7 @@ batch.
 
 ### Behavior under overload
 
-If active jobs reach `POSTCALL_MAX_ACTIVE_JOBS`, new submissions receive:
+If active requests reach `POSTCALL_MAX_ACTIVE_REQUESTS`, new submissions receive:
 
 ```text
 HTTP 429 Too Many Requests
@@ -687,42 +639,25 @@ immediately in a tight loop.
 
 ## Smoke test
 
-Start with one small request before running a concurrent benchmark.
-
-Submit:
-
-```bash
-RESPONSE=$(curl -sS -X POST http://127.0.0.1:8088/postcall/extract \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "postcall_data": [
-      {
-        "name": "interested",
-        "description": "Whether the customer expressed interest.",
-        "type": "boolean",
-        "defaultValue": false
-      }
-    ],
-    "transcription": "Customer: Yes, I am interested. Please call tomorrow."
-  }')
-
-echo "$RESPONSE"
-```
-
-Copy the returned `job_id`, then poll:
+Start with one request before running a concurrent benchmark. The included JSON
+contains caller-built `messages` and the matching `postcall_data` schema:
 
 ```bash
-curl http://127.0.0.1:8088/postcall/status/JOB_ID
+curl --fail-with-body --max-time 1200 \
+  -X POST http://127.0.0.1:8088/postcall/extract \
+  -H "Authorization: Bearer $POSTCALL_API_KEY" \
+  -H "Content-Type: application/json" \
+  --data-binary @examples/production_request.json
 ```
 
-Confirm that the job reaches `done`, the result contains every requested field,
-and the performance object contains prompt and completion token counts.
+The curl command waits for generation and prints the completed response. Confirm
+that `result` contains every requested field.
 
 ## Benchmark the live API
 
-`src/api_csv_test.py` sends production-shaped requests to a running API,
-maintains configurable client concurrency, polls each job, compares results
-with CSV ground truth locally, and saves detailed reports.
+`src/api_csv_test.py` sends caller-built message requests to a running API, keeps
+multiple POST requests in flight, compares completed results with CSV ground
+truth locally, and saves detailed reports.
 
 The API and benchmark may run on different machines. The benchmark machine does
 not need a GPU when it is testing a remote API.
@@ -740,12 +675,12 @@ The benchmark uses these columns:
 - `call_metadata`: optional JSON object.
 - `conversion_reason`: optional rule used when adding the conversion field.
 
-The benchmark adds `conversion_status` and `disposition_reason` to the request
-schema when they are missing.
+The benchmark adds `conversion_status` and `disposition_reason` when missing, then
+builds the chat messages on the client before calling the API.
 
 ### Basic benchmark
 
-Test 200 reproducibly sampled rows with at most 10 jobs in flight:
+Test 200 reproducibly sampled rows with at most 10 requests in flight:
 
 ```bash
 poetry run python src/api_csv_test.py \
@@ -765,10 +700,8 @@ poetry run python src/api_csv_test.py \
   --api-url https://postcall-api.internal.company
 ```
 
-The current benchmark client does not attach authentication headers. If the
-company gateway requires authentication, extend `_request_json` in
-`src/api_csv_test.py` or run the benchmark from an already authorized internal
-network path.
+The benchmark loads `POSTCALL_API_KEY` from the environment or project `.env`
+and sends it as a Bearer token on every request.
 
 ### Load-test progression
 
@@ -791,7 +724,7 @@ poetry run python src/api_csv_test.py --count 500 --concurrency 25
 poetry run python src/api_csv_test.py --count 1000 --concurrency 50
 ```
 
-Keep `--concurrency` at or below `POSTCALL_MAX_ACTIVE_JOBS`, leaving capacity
+Keep `--concurrency` at or below `POSTCALL_MAX_ACTIVE_REQUESTS`, leaving capacity
 for health checks and other clients.
 
 ### Production stress test without evaluation
@@ -814,7 +747,8 @@ Increase concurrency in separate runs (`20`, `30`, `40`, then `50`) while
 keeping the selected rows and seed unchanged. Stress-mode output is written to
 `output/api_stress_<timestamp>/`. `responses.jsonl` is sorted by selected
 request position and preserves every normalized result field, value, comment,
-and performance object returned by the API.
+and performance object returned by the API. The benchmark explicitly sets
+`include_performance` to `true` for its token and latency metrics.
 
 ### Benchmark options
 
@@ -822,14 +756,12 @@ and performance object returned by the API.
 |---|---:|---|
 | `--csv` | `data/Data_with_outcome_fields.csv` | Source CSV. |
 | `--count` | `200` | Number of rows to test. The current code accepts `1` through `10000`. |
-| `--concurrency` | `10` | Maximum number of in-flight API jobs. |
+| `--concurrency` | `10` | Maximum number of in-flight API requests. |
 | `--selection` | `random` | `random` for seeded sampling or `first` for the first N rows. |
 | `--seed` | `42` | Seed used for reproducible random sampling. |
 | `--api-url` | `http://127.0.0.1:8088/postcall` | API base URL. |
 | `--output-root` | `output` | Parent directory for reports. |
-| `--poll-interval` | `1.0` | Seconds between status polls. |
-| `--job-timeout` | `1200.0` | Maximum seconds to wait for a job. |
-| `--request-timeout` | `60.0` | HTTP timeout per submit or poll request. |
+| `--request-timeout` | `1200.0` | Maximum seconds to wait for each complete API response. |
 | `--no-evaluation` | disabled | Skip local scoring and run as a production stress client. |
 
 Display the command help:
@@ -854,7 +786,7 @@ output/api_test_<timestamp>/
 - `summary.json`: wall time, completed and failed counts, throughput, latency
   percentiles, retry rate, token totals, tokens per minute, strict typed
   accuracy, meaningful-value accuracy, and ground-truth coverage.
-- `rows.csv`: one row per test case with status, timing, polling, token usage,
+- `rows.csv`: one row per test case with status, timing, token usage,
   and accuracy.
 - `field_scores.csv`: per-field predictions, ground truth, schema type, type
   validity, match status, and score.
@@ -865,10 +797,10 @@ output/api_test_<timestamp>/
 During execution, the benchmark prints:
 
 - completed row count;
-- job status;
+- request status;
 - end-to-end time;
 - completion tokens;
-- per-job completion tokens per minute; and
+- per-request completion tokens per minute; and
 - rolling wall-clock completion tokens per minute.
 
 ### Metrics to compare
@@ -881,7 +813,7 @@ When tuning concurrency or GPU settings, compare:
 - generation time;
 - completion token count;
 - retry rate;
-- failed/error jobs;
+- failed requests;
 - strict type accuracy;
 - meaningful-value accuracy;
 - GPU utilization and memory use; and
@@ -1056,16 +988,17 @@ preemption, and tail latency.
 Monitor:
 
 ```bash
-curl -fsS http://127.0.0.1:8088/postcall/health
+curl -fsS -H "Authorization: Bearer $POSTCALL_API_KEY" \
+  http://127.0.0.1:8088/postcall/health
 ```
 
 Alert when:
 
 - the endpoint cannot be reached;
-- processing jobs remain high for an extended period;
+- active requests remain high for an extended period;
 - HTTP `429` responses increase;
-- error jobs increase; or
-- GPU utilization unexpectedly falls to zero while jobs are active.
+- HTTP `500` responses increase; or
+- GPU utilization unexpectedly falls to zero while requests are active.
 
 ### GPU monitoring
 
@@ -1092,38 +1025,24 @@ Useful log events include:
 - missing or incompatible adapter files;
 - JSON parse/shape failures;
 - retries;
-- job failures;
+- request failures;
 - CUDA out-of-memory errors; and
 - vLLM KV-cache preemption warnings.
 
-### Job retention
-
-Completed jobs are retained until they exceed the configured TTL or the
-completed-job count limit. Cleanup occurs during job completion and API access,
-not through a durable external scheduler.
-
-Because records are held in memory:
-
-- higher retention consumes more host RAM;
-- process restarts remove all records;
-- status polling must reach the process that owns the job; and
-- this storage design is suitable for a single-instance internal deployment,
-  but should be replaced for durable multi-replica operation.
-
 ## Security and data handling
 
-The expected deployment is private and company-only, but the application itself
-does not currently enforce authentication or request-size limits.
+The application enforces the configured Bearer API key. It does not currently
+enforce an HTTP request-size limit.
 
 Before production use:
 
 - keep the server off the public Internet;
 - allow inbound traffic only from approved company networks and services;
-- enforce company authentication at an internal gateway;
+- rotate the shared API key if it is exposed;
 - use TLS in transit;
 - configure per-client rate and concurrency limits;
 - configure maximum HTTP body and header sizes;
-- keep `POSTCALL_MAX_ACTIVE_JOBS` bounded;
+- keep `POSTCALL_MAX_ACTIVE_REQUESTS` bounded;
 - keep evaluation labels and scoring outside the production API;
 - protect model, adapter, log, CSV, and benchmark files with service-account
   permissions;
@@ -1132,9 +1051,8 @@ Before production use:
   and
 - review dependency and model-artifact updates before deployment.
 
-Treat `job_id` as sensitive operational data. Anyone who can reach this
-unauthenticated API and obtains a valid job ID can request that job's status and
-result.
+Treat the API key and call data as sensitive. Never place the key in browser
+code or commit the repository-root `.env` file.
 
 ## Troubleshooting
 
@@ -1206,26 +1124,21 @@ Try:
 - lower `VLLM_GPU_MEMORY_UTILIZATION`;
 - reduce `VLLM_MAX_MODEL_LEN`;
 - reduce client concurrency;
-- reduce `POSTCALL_MAX_ACTIVE_JOBS`;
+- reduce `POSTCALL_MAX_ACTIVE_REQUESTS`;
 - ensure only one API worker is using the GPU; and
 - stop the offline evaluator or other GPU processes.
 
 ### HTTP 429
 
-The active-job limit is full. Respect `Retry-After`, use exponential backoff,
+The active-request limit is full. Respect `Retry-After`, use exponential backoff,
 reduce client concurrency, or increase capacity only after confirming that GPU
 and host memory can support it.
 
-### HTTP 404 for a job
+### Requests remain open for a long time
 
-The job ID is invalid, expired, removed by the completed-job cap, belonged to a
-different replica, or was lost during a process restart.
+Open requests may be waiting inside vLLM or actively generating. Check:
 
-### Jobs remain in `processing`
-
-`processing` includes requests waiting inside vLLM. Check:
-
-- current active-job count;
+- current active-request count;
 - GPU utilization;
 - prompt and output lengths;
 - client concurrency;
@@ -1249,7 +1162,7 @@ Check:
 Check:
 
 - that multiple requests are actually arriving concurrently;
-- network and status-polling latency;
+- network and proxy latency;
 - CPU tokenization load;
 - prompt lengths;
 - whether the benchmark is using `--concurrency 1`;

@@ -8,6 +8,8 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from api_key_config import load_api_key
+
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_OUTPUT_DIR = PROJECT_DIR / "output"
@@ -43,19 +45,10 @@ def _parse_args() -> argparse.Namespace:
         help="Output JSON path; defaults to output/smoke_test_<timestamp>.json.",
     )
     parser.add_argument(
-        "--poll-interval",
-        type=_positive_float("poll interval"),
-        default=1.0,
-    )
-    parser.add_argument(
-        "--job-timeout",
-        type=_positive_float("job timeout"),
-        default=1200.0,
-    )
-    parser.add_argument(
         "--request-timeout",
         type=_positive_float("request timeout"),
-        default=60.0,
+        default=1200.0,
+        help="Maximum seconds to wait for the complete API response.",
     )
     return parser.parse_args()
 
@@ -66,6 +59,7 @@ def _request_json(
     *,
     payload: dict[str, Any] | None = None,
     timeout: float,
+    api_key: str,
 ) -> dict[str, Any]:
     body = (
         json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -76,7 +70,10 @@ def _request_json(
         url,
         data=body,
         method=method,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
     )
     try:
         with urlopen(request, timeout=timeout) as response:
@@ -119,63 +116,37 @@ def _default_output_path() -> Path:
 def main() -> None:
     args = _parse_args()
     payload = _load_payload(args.payload)
+    api_key = load_api_key()
     api_url = args.api_url.rstrip("/")
     output_path = args.output or _default_output_path()
 
     health = _request_json(
         "GET",
         f"{api_url}/health",
+        api_key=api_key,
         timeout=args.request_timeout,
     )
     if health.get("status") != "ok":
         raise RuntimeError(f"API health check was not OK: {health}")
 
     started = time.monotonic()
-    accepted = _request_json(
+    response = _request_json(
         "POST",
         f"{api_url}/extract",
+        api_key=api_key,
         payload=payload,
         timeout=args.request_timeout,
     )
-    job_id = accepted.get("job_id")
-    if not isinstance(job_id, str) or not job_id:
-        raise RuntimeError(f"API did not return a valid job_id: {accepted}")
-
-    print(f"Accepted job {job_id}", file=sys.stderr)
-    deadline = started + args.job_timeout
-    last_status = None
-    polls = 0
-    final_response: dict[str, Any] | None = None
-
-    while time.monotonic() < deadline:
-        response = _request_json(
-            "GET",
-            f"{api_url}/status/{job_id}",
-            timeout=args.request_timeout,
-        )
-        polls += 1
-        status = response.get("status")
-        if status != last_status:
-            print(f"Job status: {status}", file=sys.stderr)
-            last_status = status
-        if status in {"done", "error"}:
-            final_response = response
-            break
-        time.sleep(args.poll_interval)
-
-    if final_response is None:
-        raise TimeoutError(
-            f"Job {job_id} did not finish within {args.job_timeout} seconds"
-        )
+    if not isinstance(response.get("result"), dict):
+        raise RuntimeError(f"API did not return a result object: {response}")
 
     report = {
         "test": {
             "api_url": api_url,
             "payload_file": str(args.payload.resolve()),
-            "poll_count": polls,
             "end_to_end_seconds": round(time.monotonic() - started, 3),
         },
-        "response": final_response,
+        "response": response,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(
@@ -183,13 +154,9 @@ def main() -> None:
         encoding="utf-8",
     )
 
-    print(json.dumps(final_response, ensure_ascii=False, indent=2))
+    print(json.dumps(response, ensure_ascii=False, indent=2))
     print(f"Saved complete response to {output_path}", file=sys.stderr)
-
-    if final_response.get("status") != "done":
-        raise SystemExit(1)
 
 
 if __name__ == "__main__":
     main()
-

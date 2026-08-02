@@ -25,7 +25,7 @@ from vllm.lora.request import LoRARequest
 import evaluation
 from normalize_output import normalize_model_output
 from prompt_builder import SYSTEM_INSTRUCTION, build_prompt
-from schemas import ExtractRequest
+from schemas import PromptBuildRequest
 
 
 CONVERSION_STATUS_FIELD = "conversion_status"
@@ -142,7 +142,7 @@ def _add_evaluation_fields(postcall_data: list, row: pd.Series) -> list:
     return result
 
 
-def build_request(row: pd.Series) -> ExtractRequest:
+def build_request(row: pd.Series) -> PromptBuildRequest:
     functions_called = (
         json.loads(row["functions_called"]) if pd.notna(row["functions_called"]) else []
     )
@@ -152,7 +152,7 @@ def build_request(row: pd.Series) -> ExtractRequest:
     postcall_data = json.loads(row["postcall"]) if pd.notna(row["postcall"]) else []
     postcall_data = _add_evaluation_fields(postcall_data, row)
 
-    return ExtractRequest(
+    return PromptBuildRequest(
         postcall_data=postcall_data,
         transcription=row["transcription"] if pd.notna(row["transcription"]) else "",
         call_duration=(

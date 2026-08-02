@@ -12,6 +12,9 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from api_key_config import load_api_key
+from prompt_builder import SYSTEM_INSTRUCTION, build_prompt
+from schemas import PromptBuildRequest
 
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
@@ -80,15 +83,23 @@ def _build_payload(row: dict[str, str]) -> dict[str, Any]:
         _json_cell(row, "postcall", []),
         row.get("conversion_reason", ""),
     )
-    return {
-        "postcall_data": schema,
-        "transcription": row.get("transcription", ""),
-        "call_duration": (
+    prompt_request = PromptBuildRequest(
+        postcall_data=schema,
+        transcription=row.get("transcription", ""),
+        call_duration=(
             float(row["call_duration"]) if row.get("call_duration") else None
         ),
-        "hangup_reason": row.get("hangup_reason", ""),
-        "functions_called": _json_cell(row, "functions_called", []),
-        "call_metadata": _json_cell(row, "call_metadata", {}),
+        hangup_reason=row.get("hangup_reason", ""),
+        functions_called=_json_cell(row, "functions_called", []),
+        call_metadata=_json_cell(row, "call_metadata", {}),
+    )
+    return {
+        "messages": [
+            {"role": "system", "content": SYSTEM_INSTRUCTION},
+            {"role": "user", "content": build_prompt(prompt_request)},
+        ],
+        "postcall_data": schema,
+        "include_performance": True,
     }
 
 
@@ -198,6 +209,7 @@ def _request_json(
     url: str,
     payload: dict[str, Any] | None = None,
     timeout: float = 30,
+    api_key: str = "",
 ) -> dict[str, Any]:
     body = (
         json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -208,7 +220,10 @@ def _request_json(
         url,
         data=body,
         method=method,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
     )
     try:
         with urlopen(request, timeout=timeout) as response:
@@ -220,28 +235,6 @@ def _request_json(
         ) from exc
     except URLError as exc:
         raise RuntimeError(f"Cannot reach API at {url}: {exc.reason}") from exc
-
-
-def _wait_for_job(
-    api_url: str,
-    job_id: str,
-    poll_interval: float,
-    job_timeout: float,
-    request_timeout: float,
-) -> tuple[dict[str, Any], int]:
-    deadline = time.monotonic() + job_timeout
-    polls = 0
-    while time.monotonic() < deadline:
-        response = _request_json(
-            "GET",
-            f"{api_url}/status/{job_id}",
-            timeout=request_timeout,
-        )
-        polls += 1
-        if response.get("status") in {"done", "error"}:
-            return response, polls
-        time.sleep(poll_interval)
-    raise TimeoutError(f"Job {job_id} did not finish within {job_timeout}s")
 
 
 def _write_json(path: Path, value: Any) -> None:
@@ -327,7 +320,7 @@ def _parse_args() -> argparse.Namespace:
         "--concurrency",
         type=_bounded_int("concurrency", 1, MAX_ROWS),
         default=10,
-        help="Maximum number of in-flight API jobs (default: 10).",
+        help="Maximum number of in-flight API requests (default: 10).",
     )
     parser.add_argument(
         "--selection",
@@ -338,9 +331,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--api-url", default="http://127.0.0.1:8088/postcall")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
-    parser.add_argument("--poll-interval", type=float, default=1.0)
-    parser.add_argument("--job-timeout", type=float, default=1200.0)
-    parser.add_argument("--request-timeout", type=float, default=60.0)
+    parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=1200.0,
+        help="Maximum seconds to wait for each complete API response.",
+    )
     parser.add_argument(
         "--no-evaluation",
         action="store_true",
@@ -358,21 +354,17 @@ def _process_case(
     row_index: int,
     row: dict[str, str],
     api_url: str,
-    poll_interval: float,
-    job_timeout: float,
     request_timeout: float,
     evaluate: bool,
+    api_key: str,
 ) -> dict[str, Any]:
     started_at = datetime.now(timezone.utc).isoformat()
     started = time.monotonic()
-    job_id = ""
-    accepted: dict[str, Any] | None = None
     response: dict[str, Any] | None = None
     payload: dict[str, Any] | None = None
     ground_truth: dict[str, Any] = {}
     evaluation_result: dict[str, Any] | None = None
-    submit_seconds: float | None = None
-    poll_count = 0
+    request_seconds: float | None = None
     error = ""
     status = "client_error"
 
@@ -380,26 +372,20 @@ def _process_case(
         payload = _build_payload(row)
         if evaluate:
             ground_truth = _json_cell(row, "post_call_detail", {})
-        submit_started = time.monotonic()
-        accepted = _request_json(
+        request_started = time.monotonic()
+        response = _request_json(
             "POST",
             f"{api_url}/extract",
             payload,
             timeout=request_timeout,
+            api_key=api_key,
         )
-        submit_seconds = round(time.monotonic() - submit_started, 3)
-        job_id = str(accepted["job_id"])
-        response, poll_count = _wait_for_job(
-            api_url,
-            job_id,
-            poll_interval,
-            job_timeout,
-            request_timeout,
-        )
-        status = str(response.get("status", "unknown"))
-        error = str(response.get("error") or "")
+        request_seconds = round(time.monotonic() - request_started, 3)
         model_result = response.get("result")
-        if evaluate and status == "done" and isinstance(model_result, dict):
+        if not isinstance(model_result, dict):
+            raise RuntimeError(f"API did not return a result object: {response}")
+        status = "done"
+        if evaluate:
             evaluation_result = _evaluate_result(
                 payload,
                 model_result,
@@ -422,12 +408,10 @@ def _process_case(
         "position": position,
         "row_index": row_index,
         "versionId": row.get("versionId", ""),
-        "job_id": job_id,
         "status": status,
         "started_at": started_at,
-        "submit_latency_seconds": submit_seconds,
+        "api_request_seconds": request_seconds,
         "end_to_end_seconds": elapsed,
-        "poll_count": poll_count,
         "accuracy": accuracy,
         "accuracy_percent": (
             round(accuracy * 100, 2) if isinstance(accuracy, (int, float)) else None
@@ -480,8 +464,7 @@ def _process_case(
         "ground_truth": ground_truth,
         "model_result": (response or {}).get("result"),
         "evaluation": evaluation_result,
-        "accepted_response": accepted,
-        "final_response": response,
+        "api_response": response,
     }
 
 
@@ -492,12 +475,10 @@ def _row_report(result: dict[str, Any]) -> dict[str, Any]:
             "position",
             "row_index",
             "versionId",
-            "job_id",
             "status",
             "started_at",
-            "submit_latency_seconds",
+            "api_request_seconds",
             "end_to_end_seconds",
-            "poll_count",
             "accuracy",
             "accuracy_percent",
             "categorical_accuracy",
@@ -538,12 +519,11 @@ def _field_reports(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _full_response_report(result: dict[str, Any]) -> dict[str, Any]:
     """Keep the complete nested production result in deterministic row order."""
-    response = result.get("final_response") or {}
+    response = result.get("api_response") or {}
     return {
         "position": result["position"],
         "row_index": result["row_index"],
         "versionId": result["versionId"],
-        "job_id": result["job_id"],
         "status": result["status"],
         "error": result["error"],
         "result": response.get("result"),
@@ -567,10 +547,10 @@ def _build_summary(
     ]
     failed = [result for result in results if result["status"] != "done"]
     end_to_end = [float(result["end_to_end_seconds"]) for result in done]
-    submit_latencies = [
-        float(result["submit_latency_seconds"])
+    request_latencies = [
+        float(result["api_request_seconds"])
         for result in results
-        if isinstance(result.get("submit_latency_seconds"), (int, float))
+        if isinstance(result.get("api_request_seconds"), (int, float))
     ]
     row_accuracies = [float(result["accuracy"]) for result in scored]
     strict_accuracies = [
@@ -603,7 +583,7 @@ def _build_summary(
         for result in done
         if isinstance(result.get("completion_tokens"), (int, float))
     ]
-    per_job_completion_tpm = [
+    per_request_completion_tpm = [
         float(result["completion_tokens_per_minute"])
         for result in done
         if isinstance(
@@ -672,8 +652,8 @@ def _build_summary(
             "total_tokens_per_minute_wall": _tokens_per_minute(
                 total_prompt_tokens + total_completion_tokens, wall_seconds
             ),
-            "mean_per_job_completion_tokens_per_minute": _mean(
-                per_job_completion_tpm
+            "mean_per_request_completion_tokens_per_minute": _mean(
+                per_request_completion_tpm
             ),
             "retried_rows": retry_count,
             "retry_rate": (round(retry_count / len(done), 3) if done else None),
@@ -686,11 +666,11 @@ def _build_summary(
             "p99": _percentile(end_to_end, 0.99),
             "max": round(max(end_to_end), 3) if end_to_end else None,
         },
-        "submit_latency_seconds": {
-            "mean": _mean(submit_latencies),
-            "p50": _percentile(submit_latencies, 0.50),
-            "p95": _percentile(submit_latencies, 0.95),
-            "p99": _percentile(submit_latencies, 0.99),
+        "api_request_latency_seconds": {
+            "mean": _mean(request_latencies),
+            "p50": _percentile(request_latencies, 0.50),
+            "p95": _percentile(request_latencies, 0.95),
+            "p99": _percentile(request_latencies, 0.99),
         },
         "failed_row_indices": [result["row_index"] for result in failed],
         "artifacts": {
@@ -705,10 +685,9 @@ def _build_summary(
 
 def main() -> None:
     args = _parse_args()
-    if args.poll_interval <= 0:
-        raise ValueError("--poll-interval must be greater than zero")
-    if args.job_timeout <= 0 or args.request_timeout <= 0:
-        raise ValueError("timeouts must be greater than zero")
+    api_key = load_api_key()
+    if args.request_timeout <= 0:
+        raise ValueError("--request-timeout must be greater than zero")
     if not args.csv.is_file():
         raise FileNotFoundError(f"CSV not found: {args.csv}")
 
@@ -750,10 +729,9 @@ def main() -> None:
                 row_index=row_index,
                 row=rows[row_index],
                 api_url=api_url,
-                poll_interval=args.poll_interval,
-                job_timeout=args.job_timeout,
                 request_timeout=args.request_timeout,
                 evaluate=not args.no_evaluation,
+                api_key=api_key,
             ): (position, row_index)
             for position, row_index in enumerate(selected_indices, start=1)
         }
@@ -780,7 +758,7 @@ def main() -> None:
                     f"status={result['status']} time={result['end_to_end_seconds']}s "
                     f"{accuracy_text} "
                     f"output_tokens={result['completion_tokens']} "
-                    f"job_output_tpm={result['completion_tokens_per_minute']} "
+                    f"request_output_tpm={result['completion_tokens_per_minute']} "
                     f"wall_output_tpm={wall_tpm}"
                 )
 
@@ -803,12 +781,10 @@ def main() -> None:
             "position",
             "row_index",
             "versionId",
-            "job_id",
             "status",
             "started_at",
-            "submit_latency_seconds",
+            "api_request_seconds",
             "end_to_end_seconds",
-            "poll_count",
             "accuracy",
             "accuracy_percent",
             "categorical_accuracy",

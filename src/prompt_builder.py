@@ -1,7 +1,7 @@
 import json
 import re
 
-from schemas import ExtractRequest
+from schemas import PromptBuildRequest
 
 SYSTEM_INSTRUCTION = (
     "You are a call-analysis extraction engine. You are given a call "
@@ -32,7 +32,7 @@ def _shorten_description(description: str) -> str:
     )
 
 
-def build_prompt(req: ExtractRequest) -> str:
+def build_prompt(req: PromptBuildRequest) -> str:
     functions_called_json = json.dumps(
         [fc.model_dump(exclude_none=True) for fc in req.functions_called], ensure_ascii=False
     )

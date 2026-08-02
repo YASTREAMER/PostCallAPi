@@ -1,7 +1,6 @@
-from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 SCHEMA_TYPE_ALIASES = {
@@ -44,42 +43,40 @@ class VariableSpec(BaseModel):
         return normalize_schema_type(value)
 
 
-class ExtractRequest(BaseModel):
-    postcall_data: List[VariableSpec]
+class ChatMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
+    role: Literal["system", "user", "assistant"]
+    content: str = Field(min_length=1)
+
+    @field_validator("content")
+    @classmethod
+    def reject_blank_content(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("message content must not be blank")
+        return value
+
+
+class ExtractRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    messages: List[ChatMessage] = Field(min_length=1)
+    postcall_data: List[VariableSpec]
+    include_performance: bool = False
+
+
+class PromptBuildRequest(BaseModel):
+    """Structured context used by offline tools to build their own messages."""
+
+    postcall_data: List[VariableSpec]
     transcription: str
     call_duration: Optional[float] = None
     hangup_reason: Optional[str] = ""
     functions_called: List[FunctionCall] = Field(default_factory=list)
     call_metadata: Dict[str, Any] = Field(default_factory=dict)
-
     timezone: str = "Asia/Kolkata"
 
 
-class JobStatus(str, Enum):
-    PENDING = "pending"
-    PROCESSING = "processing"
-    DONE = "done"
-    ERROR = "error"
-
-
-class JobRecord(BaseModel):
-    job_id: str
-    status: JobStatus
-    result: Optional[Dict[str, Any]] = None
-    error: Optional[str] = None
-    raw_thinking: Optional[str] = None
-    performance: Optional[Dict[str, Any]] = None
-
-
-class ExtractAcceptedResponse(BaseModel):
-    job_id: str
-    status: JobStatus
-
-
-class StatusResponse(BaseModel):
-    job_id: str
-    status: JobStatus
-    result: Optional[Dict[str, Any]] = None
-    error: Optional[str] = None
+class ExtractResponse(BaseModel):
+    result: Dict[str, Any]
     performance: Optional[Dict[str, Any]] = None
