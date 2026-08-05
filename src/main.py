@@ -17,6 +17,7 @@ from runtime_config import (
 from schemas import (
     ExtractRequest,
     ExtractResponse,
+    Usage,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -83,19 +84,31 @@ async def extract(req: ExtractRequest) -> ExtractResponse:
     ACTIVE_REQUESTS += 1
     request_id = str(uuid.uuid4())
     try:
+        postcall_data = req.resolved_postcall_data()
         messages = [message.model_dump() for message in req.messages]
         output = await model_service.generate_extraction(
             messages,
             request_id=request_id,
             max_retries=MAX_GENERATION_RETRIES,
-            expected_fields=[field.name for field in req.postcall_data],
+            expected_fields=[field.name for field in postcall_data],
+            json_schema=(
+                req.response_format.json_schema["schema"]
+                if req.response_format is not None
+                else None
+            ),
+            temperature=req.temperature,
         )
-        result = normalize_model_output(output["result"], req.postcall_data)
+        result = normalize_model_output(output["result"], postcall_data)
+        performance = output.get("performance") or {}
+        usage = Usage(
+            prompt_tokens=performance.get("prompt_tokens", 0),
+            completion_tokens=performance.get("completion_tokens", 0),
+            total_tokens=performance.get("total_tokens", 0),
+        )
         return ExtractResponse(
             result=result,
-            performance=(
-                output.get("performance") if req.include_performance else None
-            ),
+            usage=usage,
+            performance=(performance if req.include_performance else None),
         )
     except Exception as exc:
         logger.exception("Request %s failed", request_id)

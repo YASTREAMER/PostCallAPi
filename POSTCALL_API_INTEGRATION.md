@@ -8,9 +8,14 @@ does not build a prompt from a transcript, metadata, or function calls.
 The backend sends:
 
 1. `messages`: the ordered chat messages given to the model;
-2. `postcall_data`: the expected output fields and their types/defaults; and
-3. optional `include_performance`: whether diagnostic timing/token data should
+2. OpenAI-style `response_format.json_schema` (recommended), or legacy
+   `postcall_data`, to define the expected output fields;
+3. optional `temperature` in the OpenAI range from `0` through `2`; and
+4. optional `include_performance`: whether diagnostic timing/token data should
    be returned.
+
+The optional `model` field is accepted for client compatibility but ignored;
+the service always uses its configured model and LoRA adapter.
 
 The API applies the local model chat template, runs vLLM with the Postcall LoRA
 adapter, validates the generated JSON, normalizes field values, and returns the
@@ -125,11 +130,20 @@ The usual production shape is:
 Message order is preserved. The API does not prepend its own system prompt and
 does not rewrite the supplied content.
 
-### `postcall_data`
+### `response_format` and `postcall_data`
 
-`postcall_data` is required even when the field definitions are already present
-inside the prompt. The API uses it outside the LLM for deterministic output
-validation and normalization.
+Send either OpenAI-style `response_format` or the legacy `postcall_data`
+array. When `response_format` is present, the API derives field names,
+descriptions, value types, and defaults from
+`response_format.json_schema.schema.properties`. The schema produced by
+`build_response_schema_for_openai()` is accepted directly and is enforced by
+vLLM structured-output decoding during token generation.
+
+If both forms are sent, their field names and ordering must match.
+`postcall_data` remains supported for backward compatibility. The API uses
+the resolved schema outside the LLM for deterministic validation and
+normalization as an additional safeguard. Legacy requests that provide only
+`postcall_data` retain the earlier validation-and-retry behavior.
 
 | Field | Required | Description |
 |---|---:|---|
@@ -147,16 +161,19 @@ The spelling and capitalization of every `name` must match the keys requested
 inside the prompt. For example, the supplied JavaScript intentionally uses
 `intrested`; the API preserves that spelling rather than correcting it.
 
-### Optional field
+### Additional fields
 
 | Field | Default | Description |
 |---|---:|---|
+| `temperature` | `0.0` | vLLM sampling temperature from `0` through `2`. |
+| `model` | `null` | Accepted for compatibility and currently ignored. |
 | `include_performance` | `false` | Include model timing and token diagnostics. |
 
-Unknown top-level request fields are rejected with HTTP `422`. Do not send the
-old top-level fields such as `transcription`, `call_duration`, `hangup_reason`,
-`functions_called`, `call_metadata`, or `timezone`. Put that information inside
-a caller-built message instead.
+Unknown top-level request fields are rejected with HTTP `422`. At least one of
+`response_format` and `postcall_data` is required. Do not send top-level
+fields such as `transcription`, `call_duration`, `hangup_reason`,
+`functions_called`, `call_metadata`, or `timezone`; put that information
+inside a caller-built message instead.
 
 ## Successful response
 
@@ -171,9 +188,20 @@ a caller-built message instead.
       "value": "2026-08-02T11:00:00",
       "comment": "User requested a callback tomorrow at 11 AM."
     }
+  },
+  "usage": {
+    "prompt_tokens": 486,
+    "completion_tokens": 61,
+    "total_tokens": 547
   }
 }
 ```
+
+Every response includes a top-level `usage` object with `prompt_tokens`,
+`completion_tokens`, and `total_tokens`. This is returned unconditionally,
+whether or not `include_performance` is set — no request field is needed to
+get token counts. The naming matches OpenAI's `usage` shape
+(`prompt_tokens`/`completion_tokens`/`total_tokens`).
 
 Every expected field is returned as:
 
@@ -186,7 +214,8 @@ Every expected field is returned as:
 
 The API checks that:
 
-- every `postcall_data[].name` exists at the top level;
+- every field resolved from `response_format` or `postcall_data` exists at
+  the top level;
 - no unexpected top-level result keys are present;
 - each field contains exactly `value` and `comment`; and
 - each comment is a non-empty string.
@@ -195,21 +224,32 @@ If the first model response has the wrong shape, the API retries with an
 additional corrective user message. It then normalizes values using
 `postcall_data`.
 
-With `include_performance: true`, the response can additionally contain:
+With `include_performance: true`, the response additionally contains a
+`performance` object with retry and timing detail on top of the `usage` field
+described above:
 
 ```json
 {
   "result": {},
+  "usage": {
+    "prompt_tokens": 486,
+    "completion_tokens": 61,
+    "total_tokens": 547
+  },
   "performance": {
     "attempts": 1,
     "retried": false,
     "generation_seconds": 2.417,
     "prompt_tokens": 486,
     "completion_tokens": 61,
+    "total_tokens": 547,
     "attempt_details": []
   }
 }
 ```
+
+`performance` is omitted entirely when `include_performance` is `false` or
+unset. `usage` is present either way.
 
 ## Node.js 18+ integration
 
@@ -239,7 +279,8 @@ const POSTCALL_API_KEY = process.env.POSTCALL_API_KEY;
 async function callPostcallAPI({
   prompt,
   userContent,
-  postcallData,
+  responseFormat,
+  temperature = 0,
   includePerformance = false,
 }) {
   if (!POSTCALL_API_KEY) {
@@ -257,7 +298,8 @@ async function callPostcallAPI({
         { role: "system", content: prompt },
         { role: "user", content: userContent },
       ],
-      postcall_data: postcallData,
+      temperature,
+      response_format: responseFormat,
       include_performance: includePerformance,
     }),
     signal: AbortSignal.timeout(20 * 60 * 1000),
@@ -301,7 +343,11 @@ try {
   const response = await callPostcallAPI({
     prompt,
     userContent,
-    postcallData: postcall_data,
+    temperature: 0.8,
+    responseFormat: {
+      type: "json_schema",
+      json_schema: build_response_schema_for_openai(postcall_data),
+    },
     includePerformance: true,
   });
 
@@ -316,6 +362,11 @@ try {
     "Post-call analysis result:\n",
     JSON.stringify(result, null, 2)
   );
+
+  // response.usage is always present, regardless of includePerformance.
+  console.log("Input tokens:", response.usage.prompt_tokens);
+  console.log("Output tokens:", response.usage.completion_tokens);
+  console.log("Total tokens:", response.usage.total_tokens);
 
   if (response.performance) {
     console.log("Performance:", response.performance);
@@ -369,20 +420,28 @@ The supplied script performs these steps:
 9. Parses the assistant content as JSON and adds an `x_model_used` field only
    in the JavaScript result after generation.
 
-For the H200 API, the backend should reuse the same `prompt` and `userContent`
-as the two entries in `messages`, and send the original `postcall_data`
-alongside them. The following Azure-only properties are not part of the H200
-request:
+For the H200 API, reuse the same `prompt` and `userContent` as the two
+entries in `messages`, and send the existing
+`build_response_schema_for_openai(postcall_data)` output as
+`response_format.json_schema`. The API accepts `temperature` and applies it
+to vLLM sampling, while the JSON Schema constrains generation itself. It also
+accepts `model` for compatibility but ignores its value because the H200 model
+and LoRA adapter are fixed by the service.
 
-- `model`: the H200 model and LoRA adapter are fixed by the service;
-- `temperature`: the service currently uses deterministic temperature `0.0`;
-- `response_format`: the service validates the generated JSON using
-  `postcall_data`; and
-- Azure endpoint, API version, token pricing, and Azure SDK credentials.
+Azure endpoint, API version, token pricing, and Azure SDK credentials are not
+part of the H200 request.
 
-The H200 API returns `result` directly rather than an Azure `choices` object.
-If the backend still needs `x_model_used`, it should add it after receiving the
-H200 response, just as the supplied JavaScript currently does.
+The H200 API returns `result` directly rather than an Azure `choices` object,
+so there is no `JSON.parse(response.choices[0].message.content)` step. If the
+backend still needs `x_model_used`, it should add it after receiving the H200
+response, just as the supplied JavaScript currently does.
+
+Token usage works the same way in both: the H200 API's top-level `usage`
+object uses the same field names as Azure's (`prompt_tokens`,
+`completion_tokens`, `total_tokens`), so the existing cost-estimation logic
+can be reused as-is. The one difference: the H200 API does not track
+cached-token counts, so treat `cached_tokens` as always `0` when reusing that
+logic.
 
 ## Interactive documentation
 

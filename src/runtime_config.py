@@ -9,11 +9,11 @@ ADAPTER_NAME = "postcall-adapter"
 ADAPTER_ID = 1
 MAX_LORA_RANK = 16
 
-MAX_MODEL_LEN = int(os.environ.get("VLLM_MAX_MODEL_LEN", "16384"))
+MAX_MODEL_LEN = int(os.environ.get("VLLM_MAX_MODEL_LEN", "32768"))
 MAX_NEW_TOKENS = int(os.environ.get("VLLM_MAX_NEW_TOKENS", "8192"))
 MIN_NEW_TOKENS = int(os.environ.get("VLLM_MIN_NEW_TOKENS", "1024"))
 TOKENS_PER_FIELD = int(os.environ.get("VLLM_TOKENS_PER_FIELD", "64"))
-MAX_GENERATION_RETRIES = int(os.environ.get("VLLM_MAX_GENERATION_RETRIES", "1"))
+MAX_GENERATION_RETRIES = int(os.environ.get("VLLM_MAX_GENERATION_RETRIES", "3"))
 GPU_MEMORY_UTILIZATION = float(
     os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.5")
 )
@@ -25,7 +25,7 @@ ENABLE_PREFIX_CACHING = os.environ.get(
 ).strip().casefold() in {"1", "true", "yes", "on"}
 
 API_HOST = os.environ.get("POSTCALL_API_HOST", "0.0.0.0")
-API_PORT = int(os.environ.get("POSTCALL_API_PORT", "8088"))
+API_PORT = int(os.environ.get("POSTCALL_API_PORT", "8808"))
 API_PREFIX = os.environ.get("POSTCALL_API_PREFIX", "/postcall").strip()
 MAX_ACTIVE_REQUESTS = int(
     os.environ.get(

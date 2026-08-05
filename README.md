@@ -655,6 +655,117 @@ that `result` contains every requested field.
 
 ## Benchmark the live API
 
+### External laptop benchmark
+
+Use `benchmark.py` when testing strictly as an API consumer from a laptop.
+It uses only the Python standard library, never imports the model/API runtime,
+and tests exactly one remote server per command.
+
+Requirements:
+
+- Python 3.10 or newer;
+- this repository's `data/Data_with_outcome_fields.csv`; and
+- `POSTCALL_API_KEY` in the laptop environment or repository-root `.env`.
+
+The `.env` file may contain only:
+
+```env
+POSTCALL_API_KEY=replace-with-the-server-key
+```
+
+Run the fixed concurrency sweep:
+
+```bash
+python3 benchmark.py \
+  --api-url http://101.53.137.25:8808/postcall \
+  --rows 200 \
+  --random-state 42
+```
+
+The only required arguments are `--api-url` and `--rows`. The default CSV is
+`data/Data_with_outcome_fields.csv`. For every selected row, the runner builds
+the same two-message format as `js_test/postcall.js`:
+
+- the system message contains `<task>`, `<details>`, current India time,
+  the row's `conversion_reason`, and the complete augmented `postcall`
+  array inside `<variables_to_extract>`;
+- the user message contains `call_duration`, `hangup_reason`,
+  `transcription`, `functions_called`, and `call_metadata` in the same
+  XML-style sections; and
+- `conversion_status` and `disposition_reason` are retained from
+  `postcall` or added if a future row omits them.
+
+The CSV's `post_call_detail` ground truth is never included in `messages`,
+`response_format`, or the HTTP request body. It is read locally only after
+payload construction to calculate report accuracy.
+
+The row count must be at least 50. The runner performs one authenticated health
+check, then tests the same selected rows independently at the configured
+concurrency levels:
+
+```text
+20, 25, 30, 35, 40, 45, 50, 75, 100, 125, 150
+```
+
+There are no warm-up requests and no automatic HTTP retries. A run with
+`--rows 200` makes 2,200 extraction requests. `--random-state` controls
+reproducible random row selection; `--seed` remains an equivalent alias.
+
+The effective number of simultaneous requests cannot exceed the selected row
+count. Use at least `--rows 150` to fully exercise the configured concurrency
+150 level. Levels above the health endpoint's `max_active_requests` may
+intentionally produce HTTP `429` responses.
+
+Run the command separately with a different URL to benchmark another server.
+Never supply two servers to one invocation if the goal is an independent
+comparison.
+
+Results are stored locally:
+
+```text
+output/benchmark_<timestamp>/<server>/
+├── run_config.json
+├── overall_summary.json
+├── concurrency_020/
+│   ├── config.json
+│   ├── results.jsonl
+│   ├── responses.jsonl
+│   ├── rows.csv
+│   ├── field_scores.csv
+│   └── summary.json
+├── concurrency_025/
+├── ...
+├── concurrency_125/
+└── concurrency_150/
+```
+
+Each completed request is flushed immediately to the current concurrency
+directory. Its `summary.json` is finalized before the next concurrency level
+starts, and `overall_summary.json` is updated after every completed level.
+The API key is never written to an artifact.
+
+Every concurrency directory contains its own complete evaluation. Its
+`summary.json` includes requested/completed/scored/failed rows, wall time,
+throughput, row and field accuracy, strict and meaningful match rates,
+ground-truth coverage, generation time, token totals and rates, retries,
+end-to-end latency percentiles, submit latency percentiles, and failed row
+indices. `field_scores.csv` contains the individual field-level comparisons.
+
+For this direct-response API, `submit_latency_seconds` measures how long the
+laptop takes to schedule each task in its thread pool. It is not a separate
+HTTP job-submission latency.
+
+Additional optional controls are available through:
+
+```bash
+python3 benchmark.py --help
+```
+
+The existing `src/api_csv_test.py` remains available as the repository's
+internal single-concurrency evaluation tool.
+
+### Internal benchmark tool
+
 `src/api_csv_test.py` sends caller-built message requests to a running API, keeps
 multiple POST requests in flight, compares completed results with CSV ground
 truth locally, and saves detailed reports.

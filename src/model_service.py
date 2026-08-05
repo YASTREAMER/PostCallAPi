@@ -14,6 +14,7 @@ from runtime_config import (
     validate_runtime_paths,
 )
 
+import inspect
 import json
 import logging
 import re
@@ -26,6 +27,15 @@ from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 
 logger = logging.getLogger("model_service")
+
+if "structured_outputs" in inspect.signature(SamplingParams).parameters:
+    from vllm.sampling_params import StructuredOutputsParams
+
+    _STRUCTURED_OUTPUTS_PARAMETER = "structured_outputs"
+else:
+    from vllm.sampling_params import GuidedDecodingParams as StructuredOutputsParams
+
+    _STRUCTURED_OUTPUTS_PARAMETER = "guided_decoding"
 
 _engine: Optional[AsyncLLMEngine] = None
 _tokenizer = None
@@ -121,15 +131,23 @@ async def _run_generation(
     messages: Sequence[Mapping[str, str]],
     request_id: str,
     requested_max_tokens: int,
+    temperature: float,
+    json_schema: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     text = _build_prompt_text(messages)
     prompt_token_ids = _tokenizer.encode(text)
     available_tokens = max(1, MAX_MODEL_LEN - len(prompt_token_ids) - 32)
     generation_limit = min(requested_max_tokens, available_tokens)
 
+    structured_output_kwargs = {}
+    if json_schema is not None:
+        structured_output_kwargs[_STRUCTURED_OUTPUTS_PARAMETER] = (
+            StructuredOutputsParams(json=dict(json_schema))
+        )
     sampling_params = SamplingParams(
-        temperature=0.0,
+        temperature=temperature,
         max_tokens=generation_limit,
+        **structured_output_kwargs,
     )
 
     started = time.monotonic()
@@ -147,14 +165,21 @@ async def _run_generation(
 
     completion = final_output.outputs[0]
     completion_token_ids = getattr(completion, "token_ids", None) or []
+    prompt_tokens = len(prompt_token_ids)
+    completion_tokens = len(completion_token_ids)
     usage = {
         "generation_seconds": round(time.monotonic() - started, 3),
-        "prompt_tokens": len(prompt_token_ids),
-        "completion_tokens": len(completion_token_ids),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
         "max_tokens": generation_limit,
         "finish_reason": getattr(completion, "finish_reason", None),
     }
     return completion.text, usage
+
+
+def _normalize_top_level_keys(result: Dict[str, Any]) -> Dict[str, Any]:
+    return {(key.strip() if isinstance(key, str) else key): value for key, value in result.items()}
 
 
 def _validate_commented_result(
@@ -218,6 +243,8 @@ async def generate_extraction(
     request_id: str,
     max_retries: int = 1,
     expected_fields: Optional[Sequence[str]] = None,
+    json_schema: Optional[Mapping[str, Any]] = None,
+    temperature: float = 0.0,
 ) -> Dict[str, Any]:
     last_error = None
     last_raw = None
@@ -242,6 +269,8 @@ async def generate_extraction(
             generation_messages,
             f"{request_id}-attempt{attempt}",
             requested_max_tokens,
+            temperature,
+            json_schema,
         )
         usage["attempt"] = attempt + 1
         attempt_usage.append(usage)
@@ -249,6 +278,7 @@ async def generate_extraction(
         answer_text, thinking = _strip_think_block(raw)
         try:
             parsed = _extract_json(answer_text)
+            parsed = _normalize_top_level_keys(parsed)
             _validate_commented_result(parsed, expected_fields)
             performance = {
                 "attempts": attempt + 1,
@@ -261,6 +291,9 @@ async def generate_extraction(
                 ),
                 "completion_tokens": sum(
                     item["completion_tokens"] for item in attempt_usage
+                ),
+                "total_tokens": sum(
+                    item["total_tokens"] for item in attempt_usage
                 ),
                 "attempt_details": attempt_usage,
             }
