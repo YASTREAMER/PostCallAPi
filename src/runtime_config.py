@@ -1,7 +1,42 @@
 
 import json
 import os
+import subprocess
 from pathlib import Path
+
+
+def _pick_free_gpu() -> str:
+    """Return the index of the GPU with the least memory used."""
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+        gpus = [
+            line.split(", ")
+            for line in result.stdout.strip().splitlines()
+            if line.strip()
+        ]
+        best_index, _ = min(gpus, key=lambda gpu: int(gpu[1]))
+        return best_index
+    except Exception:
+        return "0"
+
+
+# Select which GPU to run on before vLLM/torch initialize CUDA. Set
+# POSTCALL_GPU_DEVICE to pin a specific device (e.g. "1"); otherwise the
+# GPU with the least memory currently in use is picked automatically.
+if "CUDA_VISIBLE_DEVICES" not in os.environ:
+    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get(
+        "POSTCALL_GPU_DEVICE", ""
+    ).strip() or _pick_free_gpu()
 
 MODEL_ID = "unsloth/Qwen3-14B-unsloth-bnb-4bit"
 ADAPTER_DIR = Path(__file__).resolve().parent.parent / "adapter"
