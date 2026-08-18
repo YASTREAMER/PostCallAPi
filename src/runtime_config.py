@@ -1,5 +1,4 @@
 
-import json
 import os
 import subprocess
 from pathlib import Path
@@ -38,17 +37,24 @@ if "CUDA_VISIBLE_DEVICES" not in os.environ:
         "POSTCALL_GPU_DEVICE", ""
     ).strip() or _pick_free_gpu()
 
-MODEL_ID = "unsloth/Qwen3-14B-unsloth-bnb-4bit"
-ADAPTER_DIR = Path(__file__).resolve().parent.parent / "adapter"
-ADAPTER_NAME = "postcall-adapter"
-ADAPTER_ID = 1
-MAX_LORA_RANK = 16
+MODEL_ID = str(
+    Path(__file__).resolve().parent.parent / "model" / "merged_bf16-fp8"
+)
+# Canonical caller-facing model name always reported in responses, regardless
+# of which gateway alias ("krishna-2.5" or "postcall-qwen3-14b-lora") a
+# request came in as (the internal HF model id above should never leak out).
+DEFAULT_MODEL_NAME = os.environ.get("POSTCALL_DEFAULT_MODEL_NAME", "krishna-2.5")
 
 MAX_MODEL_LEN = int(os.environ.get("VLLM_MAX_MODEL_LEN", "32768"))
 MAX_NEW_TOKENS = int(os.environ.get("VLLM_MAX_NEW_TOKENS", "8192"))
 MIN_NEW_TOKENS = int(os.environ.get("VLLM_MIN_NEW_TOKENS", "1024"))
 TOKENS_PER_FIELD = int(os.environ.get("VLLM_TOKENS_PER_FIELD", "64"))
 MAX_GENERATION_RETRIES = int(os.environ.get("VLLM_MAX_GENERATION_RETRIES", "3"))
+# Upper bound injected into each field's "comment" JSON-schema property when
+# a caller's response_format doesn't already cap it, so a loosely specified
+# schema (e.g. missing "required") can't let the model ramble in a comment
+# until it exhausts the whole generation budget.
+COMMENT_MAX_CHARS = int(os.environ.get("POSTCALL_COMMENT_MAX_CHARS", "400"))
 GPU_MEMORY_UTILIZATION = float(
     os.environ.get("VLLM_GPU_MEMORY_UTILIZATION", "0.5")
 )
@@ -89,33 +95,7 @@ if TOKENS_PER_FIELD <= 0:
     raise ValueError("VLLM_TOKENS_PER_FIELD must be greater than zero")
 if MAX_GENERATION_RETRIES < 0:
     raise ValueError("VLLM_MAX_GENERATION_RETRIES cannot be negative")
+if COMMENT_MAX_CHARS <= 0:
+    raise ValueError("POSTCALL_COMMENT_MAX_CHARS must be greater than zero")
 if MAX_ACTIVE_REQUESTS <= 0:
     raise ValueError("POSTCALL_MAX_ACTIVE_REQUESTS must be greater than zero")
-
-
-def validate_runtime_paths() -> None:
-    required_adapter_files = (
-        ADAPTER_DIR / "adapter_config.json",
-        ADAPTER_DIR / "adapter_model.safetensors",
-    )
-    missing = [str(path) for path in required_adapter_files if not path.is_file()]
-    if missing:
-        raise FileNotFoundError(
-            "LoRA adapter is incomplete; missing: " + ", ".join(missing)
-        )
-
-    adapter_config = json.loads(
-        (ADAPTER_DIR / "adapter_config.json").read_text(encoding="utf-8")
-    )
-    adapter_base = adapter_config.get("base_model_name_or_path")
-    if adapter_base != MODEL_ID:
-        raise ValueError(
-            f"Adapter expects base model {adapter_base!r}, but MODEL_ID is {MODEL_ID!r}"
-        )
-
-    adapter_rank = adapter_config.get("r")
-    if adapter_rank != MAX_LORA_RANK:
-        raise ValueError(
-            f"Adapter rank is {adapter_rank!r}, but MAX_LORA_RANK is "
-            f"{MAX_LORA_RANK!r}"
-        )

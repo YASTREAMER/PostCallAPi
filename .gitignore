@@ -9,3 +9,6 @@ output/
 examples/
 js_test/
 POSTCALL_API_INTEGRATION.md
+model/
+__pycache__
+.claude

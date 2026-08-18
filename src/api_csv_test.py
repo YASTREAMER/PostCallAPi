@@ -237,6 +237,19 @@ def _request_json(
         raise RuntimeError(f"Cannot reach API at {url}: {exc.reason}") from exc
 
 
+def _openai_result(response: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Extract the extracted-fields dict from an OpenAI-shaped /extract response."""
+    try:
+        content = response["choices"][0]["message"]["content"]
+        return json.loads(content)
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+
+
+def _openai_performance(response: dict[str, Any] | None) -> dict[str, Any]:
+    return ((response or {}).get("usage") or {}).get("latency_checkpoint") or {}
+
+
 def _write_json(path: Path, value: Any) -> None:
     path.write_text(
         json.dumps(value, ensure_ascii=False, indent=2) + "\n",
@@ -381,7 +394,7 @@ def _process_case(
             api_key=api_key,
         )
         request_seconds = round(time.monotonic() - request_started, 3)
-        model_result = response.get("result")
+        model_result = _openai_result(response)
         if not isinstance(model_result, dict):
             raise RuntimeError(f"API did not return a result object: {response}")
         status = "done"
@@ -399,7 +412,7 @@ def _process_case(
         evaluation_result.get("overall_score") if evaluation_result else None
     )
     field_count = len((evaluation_result or {}).get("fields") or {})
-    performance = (response or {}).get("performance") or {}
+    performance = _openai_performance(response)
     generation_seconds = performance.get("generation_seconds")
     prompt_tokens = performance.get("prompt_tokens")
     completion_tokens = performance.get("completion_tokens")
@@ -462,7 +475,7 @@ def _process_case(
         "retried": performance.get("retried"),
         "error": error,
         "ground_truth": ground_truth,
-        "model_result": (response or {}).get("result"),
+        "model_result": _openai_result(response),
         "evaluation": evaluation_result,
         "api_response": response,
     }
@@ -526,8 +539,8 @@ def _full_response_report(result: dict[str, Any]) -> dict[str, Any]:
         "versionId": result["versionId"],
         "status": result["status"],
         "error": result["error"],
-        "result": response.get("result"),
-        "performance": response.get("performance"),
+        "result": _openai_result(response),
+        "performance": _openai_performance(response),
     }
 
 

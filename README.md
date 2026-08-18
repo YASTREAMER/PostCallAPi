@@ -530,18 +530,52 @@ curl -X POST http://127.0.0.1:8088/postcall/extract \
   --data-binary @request.json
 ```
 
-Completed response:
+Completed response (shaped like an OpenAI chat completion — the extracted
+fields are JSON-encoded inside `choices[0].message.content`):
 
 ```json
 {
-  "result": {
-    "customer_interested": {
-      "value": true,
-      "comment": "Customer said the offer sounds interesting."
+  "id": "chatcmpl-3f9c6e2b8c4a4c6c9b6e2b8c4a4c6c9b",
+  "object": "chat.completion",
+  "created": 1755180000,
+  "model": "unsloth/Qwen3-14B-unsloth-bnb-4bit",
+  "choices": [
+    {
+      "index": 0,
+      "finish_reason": "stop",
+      "logprobs": null,
+      "content_filter_results": {},
+      "message": {
+        "role": "assistant",
+        "content": "{\"customer_interested\": {\"value\": true, \"comment\": \"Customer said the offer sounds interesting.\"}}",
+        "refusal": null,
+        "annotations": []
+      }
     }
-  }
+  ],
+  "usage": {
+    "prompt_tokens": 48,
+    "completion_tokens": 32,
+    "total_tokens": 80,
+    "prompt_tokens_details": { "audio_tokens": 0, "cached_tokens": 0 },
+    "completion_tokens_details": {
+      "accepted_prediction_tokens": 0,
+      "audio_tokens": 0,
+      "reasoning_tokens": 0,
+      "rejected_prediction_tokens": 0
+    }
+  },
+  "system_fingerprint": "fp_postcall-adapter",
+  "service_tier": "default",
+  "prompt_filter_results": [
+    { "prompt_index": 0, "content_filter_results": {} }
+  ]
 }
 ```
+
+Callers extract the normalized fields with
+`JSON.parse(choices[0].message.content)`. When `include_performance` is
+`true`, diagnostic timing/token metadata is added at `usage.latency_checkpoint`.
 
 The endpoint returns HTTP `200` only after generation finishes. There are no
 job IDs or status polling. Generation failures return HTTP `500`; an overloaded
@@ -553,7 +587,7 @@ inference queue returns HTTP `429`.
 |---|---|---|
 | `messages` | Yes | Ordered chat messages supplied by the caller. |
 | `postcall_data` | Yes | Fields used to validate and normalize the generated JSON. |
-| `include_performance` | No | Include diagnostic timing/token metadata; defaults to `false`. |
+| `include_performance` | No | Include diagnostic timing/token metadata at `usage.latency_checkpoint`; defaults to `false`. |
 
 Each `messages` item contains a non-empty `content` string and a `role` of
 `system`, `user`, or `assistant`. The API preserves message order and does not

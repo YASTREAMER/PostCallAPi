@@ -137,7 +137,11 @@ def main() -> None:
         payload=payload,
         timeout=args.request_timeout,
     )
-    if not isinstance(response.get("result"), dict):
+    try:
+        model_result = json.loads(response["choices"][0]["message"]["content"])
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        raise RuntimeError(f"API did not return a valid result object: {response}") from exc
+    if not isinstance(model_result, dict):
         raise RuntimeError(f"API did not return a result object: {response}")
 
     report = {

@@ -449,6 +449,19 @@ def _request_json(
     return decoded
 
 
+def _openai_result(response: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Extract the extracted-fields dict from an OpenAI-shaped /extract response."""
+    try:
+        content = response["choices"][0]["message"]["content"]
+        return json.loads(content)
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+
+
+def _openai_performance(response: dict[str, Any] | None) -> dict[str, Any]:
+    return ((response or {}).get("usage") or {}).get("latency_checkpoint") or {}
+
+
 def _value_matches_json_type(value: Any, schema_type: str) -> bool:
     if schema_type == "boolean":
         return isinstance(value, bool)
@@ -704,7 +717,7 @@ def _process_case(
         finally:
             request_seconds = round(time.monotonic() - request_started, 3)
 
-        result = response.get("result")
+        result = _openai_result(response)
         if not isinstance(result, dict):
             raise APIRequestError(
                 "API response is missing a result object",
@@ -727,7 +740,7 @@ def _process_case(
         error = f"{type(exc).__name__}: {exc}"
 
     elapsed = round(time.monotonic() - started, 3)
-    performance = (response or {}).get("performance") or {}
+    performance = _openai_performance(response)
     generation_seconds = performance.get("generation_seconds")
     prompt_tokens = performance.get("prompt_tokens")
     completion_tokens = performance.get("completion_tokens")

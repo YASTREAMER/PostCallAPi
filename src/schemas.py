@@ -2,6 +2,8 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from runtime_config import COMMENT_MAX_CHARS
+
 
 SCHEMA_TYPE_ALIASES = {
     "bool": "boolean",
@@ -120,6 +122,41 @@ def _variables_from_response_format(
     return variables
 
 
+def normalize_response_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """Repairs structural gaps callers commonly leave out of a value/comment
+    JSON schema (missing "type": "object", missing "required") before it is
+    handed to the model's structured-output grammar. Without "required",
+    the grammar treats "value"/"comment" as optional, letting the model
+    satisfy the schema with a partial (or unboundedly long) field object.
+    """
+    schema = dict(schema)
+    schema["type"] = "object"
+
+    properties = dict(schema.get("properties") or {})
+    for name, field_schema in properties.items():
+        if not isinstance(field_schema, dict):
+            continue
+        field_schema = dict(field_schema)
+        field_schema["type"] = "object"
+
+        nested = dict(field_schema.get("properties") or {})
+        value_schema = dict(nested.get("value") or {"type": "string"})
+        comment_schema = dict(nested.get("comment") or {"type": "string"})
+        comment_schema.setdefault("maxLength", COMMENT_MAX_CHARS)
+        nested["value"] = value_schema
+        nested["comment"] = comment_schema
+
+        field_schema["properties"] = nested
+        field_schema["required"] = ["value", "comment"]
+        field_schema["additionalProperties"] = False
+        properties[name] = field_schema
+
+    schema["properties"] = properties
+    schema["required"] = list(properties.keys())
+    schema["additionalProperties"] = False
+    return schema
+
+
 class ExtractRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -168,13 +205,58 @@ class PromptBuildRequest(BaseModel):
     timezone: str = "Asia/Kolkata"
 
 
+class ChatCompletionMessage(BaseModel):
+    role: Literal["assistant"] = "assistant"
+    content: str
+    refusal: Optional[str] = None
+    annotations: List[Any] = Field(default_factory=list)
+
+
+class Choice(BaseModel):
+    index: int = 0
+    finish_reason: Optional[str] = None
+    logprobs: Optional[Any] = None
+    content_filter_results: Dict[str, Any] = Field(default_factory=dict)
+    message: ChatCompletionMessage
+
+
+class PromptTokensDetails(BaseModel):
+    audio_tokens: int = 0
+    cached_tokens: int = 0
+
+
+class CompletionTokensDetails(BaseModel):
+    accepted_prediction_tokens: int = 0
+    audio_tokens: int = 0
+    reasoning_tokens: int = 0
+    rejected_prediction_tokens: int = 0
+
+
 class Usage(BaseModel):
     prompt_tokens: int
     completion_tokens: int
     total_tokens: int
+    prompt_tokens_details: PromptTokensDetails = Field(
+        default_factory=PromptTokensDetails
+    )
+    completion_tokens_details: CompletionTokensDetails = Field(
+        default_factory=CompletionTokensDetails
+    )
+    latency_checkpoint: Optional[Dict[str, Any]] = None
+
+
+class PromptFilterResult(BaseModel):
+    prompt_index: int = 0
+    content_filter_results: Dict[str, Any] = Field(default_factory=dict)
 
 
 class ExtractResponse(BaseModel):
-    result: Dict[str, Any]
+    id: str
+    object: Literal["chat.completion"] = "chat.completion"
+    created: int
+    model: str
+    choices: List[Choice]
     usage: Usage
-    performance: Optional[Dict[str, Any]] = None
+    system_fingerprint: Optional[str] = None
+    service_tier: str = "default"
+    prompt_filter_results: List[PromptFilterResult] = Field(default_factory=list)

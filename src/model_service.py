@@ -1,17 +1,12 @@
 from runtime_config import (
-    ADAPTER_DIR,
-    ADAPTER_ID,
-    ADAPTER_NAME,
     ENABLE_PREFIX_CACHING,
     ENABLE_THINKING,
     GPU_MEMORY_UTILIZATION,
-    MAX_LORA_RANK,
     MAX_MODEL_LEN,
     MAX_NEW_TOKENS,
     MIN_NEW_TOKENS,
     TOKENS_PER_FIELD,
     MODEL_ID,
-    validate_runtime_paths,
 )
 
 import inspect
@@ -21,7 +16,6 @@ import re
 import time
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
-from vllm.lora.request import LoRARequest
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
@@ -39,7 +33,6 @@ else:
 
 _engine: Optional[AsyncLLMEngine] = None
 _tokenizer = None
-_lora_request = LoRARequest(ADAPTER_NAME, ADAPTER_ID, str(ADAPTER_DIR))
 
 
 async def load_model() -> None:
@@ -47,23 +40,13 @@ async def load_model() -> None:
     if _engine is not None:
         return
 
-    validate_runtime_paths()
-    logger.info(
-        "Starting vLLM AsyncLLMEngine for %s with adapter %s ...",
-        MODEL_ID,
-        ADAPTER_DIR,
-    )
+    logger.info("Starting vLLM AsyncLLMEngine for %s ...", MODEL_ID)
     engine_args = AsyncEngineArgs(
         model=MODEL_ID,
         dtype="bfloat16",
-        quantization="bitsandbytes",
-        load_format="bitsandbytes",
         gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         max_model_len=MAX_MODEL_LEN,
         enable_prefix_caching=ENABLE_PREFIX_CACHING,
-        enable_lora=True,
-        max_loras=1,
-        max_lora_rank=MAX_LORA_RANK,
     )
     _engine = AsyncLLMEngine.from_engine_args(engine_args)
     _tokenizer = await _engine.get_tokenizer()
@@ -156,7 +139,6 @@ async def _run_generation(
         text,
         sampling_params,
         request_id,
-        lora_request=_lora_request,
     ):
         final_output = request_output
 
